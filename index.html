@@ -1,0 +1,3621 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="My Planner" />
+  <meta name="theme-color" content="#FAF6F1" />
+  <link rel="manifest" href="manifest.json" />
+  <link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%23C8966E'/><text y='.9em' font-size='75' x='12'>🫖</text></svg>" />
+  <title>🫖 My Planner</title>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    html,body{height:100%;background:#FAF6F1}
+    body{font-family:-apple-system,'Noto Sans TC','Microsoft JhengHei',sans-serif;-webkit-tap-highlight-color:transparent;-webkit-text-size-adjust:100%}
+    input,select,textarea,button{font-family:inherit}
+    #root{min-height:100vh}
+    #loading{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#FAF6F1;z-index:9999;gap:12px}
+    #loading .spinner{width:36px;height:36px;border:3px solid #E0CEBC;border-top-color:#C8966E;border-radius:50%;animation:spin 0.8s linear infinite}
+    #loading p{color:#9A7B65;font-size:14px}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    ::-webkit-scrollbar{width:4px;height:4px}
+    ::-webkit-scrollbar-thumb{background:#D4BAA0;border-radius:2px}
+  </style>
+</head>
+<body>
+  <div id="loading"><div class="spinner"></div><p>載入中...</p></div>
+  <div id="root"></div>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js" crossorigin></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.4/babel.min.js" crossorigin></script>
+  <script type="text/babel" data-type="module">
+    const { useState, useEffect, useRef } = React;
+
+// ═══════════════════════════════════════════════════════
+// SUPABASE CONFIG
+// ═══════════════════════════════════════════════════════
+const SUPABASE_URL = "https://sznmfrplhlzxgtomhhrb.supabase.co";
+const SUPABASE_KEY = "sb_publishable_YNF9lbK3oSFnOgzuPswCIQ_hFE9p_2B";
+const TABLE = "project_data";
+// Use a fixed user key derived from the Supabase project — same across all devices/contexts
+const USER_KEY = "crystal970625_planner";
+
+// Supabase REST helpers
+const sbHeaders = {
+  "apikey": SUPABASE_KEY,
+  "Authorization": `Bearer ${SUPABASE_KEY}`,
+  "Content-Type": "application/json",
+  "Prefer": "return=minimal",
+};
+
+async function sbLoad() {
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/${TABLE}?user_key=eq.${encodeURIComponent(USER_KEY)}&select=data`,
+      { headers: sbHeaders }
+    );
+    if (!res.ok) return null;
+    const rows = await res.json();
+    return rows.length > 0 ? rows[0].data : null;
+  } catch { return null; }
+}
+
+async function sbSave(snapshot) {
+  try {
+    // Try PATCH first (update existing row)
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/${TABLE}?user_key=eq.${encodeURIComponent(USER_KEY)}`,
+      {
+        method: "PATCH",
+        headers: sbHeaders,
+        body: JSON.stringify({
+          data: snapshot,
+          updated_at: new Date().toISOString(),
+        }),
+      }
+    );
+    // If no row was updated (new user), INSERT instead
+    if (res.ok) {
+      const text = await res.text();
+      // PATCH returns empty body when rows=0, so try insert if needed
+    }
+  } catch {}
+}
+
+// ═══════════════════════════════════════════════════════
+// STORAGE HELPERS — localStorage cache + Supabase sync
+// ═══════════════════════════════════════════════════════
+
+// Global pending save timer
+let _saveTimer = null;
+let _pendingSnapshot = {};
+
+function scheduleCloudSave() {
+  clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(() => {
+    // Build full snapshot from localStorage
+    const snapshot = {};
+    ALL_KEYS.forEach(k => {
+      try {
+        const v = localStorage.getItem(k);
+        if (v !== null) snapshot[k] = JSON.parse(v);
+      } catch {}
+    });
+    sbSave(snapshot);
+  }, 1500); // debounce: save 1.5s after last change
+}
+
+const useStorage = (key, defaultValue) => {
+  const [state, setState] = useState(() => {
+    try {
+      const stored = localStorage.getItem(key);
+      return stored ? JSON.parse(stored) : defaultValue;
+    } catch { return defaultValue; }
+  });
+  const set = (val) => {
+    const next = typeof val === "function" ? val(state) : val;
+    setState(next);
+    try {
+      localStorage.setItem(key, JSON.stringify(next));
+      scheduleCloudSave(); // sync to Supabase after every change
+    } catch {}
+  };
+  return [state, set];
+};
+
+// All storage keys used in the app
+const ALL_KEYS = [
+  "diary-entries","habit-data","quick-notes",
+  "tasks","goals","projects",
+  "finance","period","bookmarks","memos",
+  "campus-semester","campus-courses","grad-req","exam-hw","activities",
+  "task-types","customCourseTypes","bookmarks-open-folder",
+  "finance-budget",
+];
+
+function exportAllData() {
+  const snapshot = {};
+  ALL_KEYS.forEach(k => {
+    try {
+      const v = localStorage.getItem(k);
+      if (v !== null) snapshot[k] = JSON.parse(v);
+    } catch {}
+  });
+  snapshot.__exportedAt = new Date().toISOString();
+  const json = JSON.stringify(snapshot, null, 2);
+  const dataUri = "data:application/json;charset=utf-8," + encodeURIComponent(json);
+  const a = document.createElement("a");
+  a.href = dataUri;
+  a.download = `my-planner-backup-${new Date().toISOString().slice(0,10)}.json`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}
+
+function importAllData(file, onDone) {
+  const r = new FileReader();
+  r.onload = (e) => {
+    try {
+      const data = JSON.parse(e.target.result);
+      ALL_KEYS.forEach(k => {
+        if (data[k] !== undefined) localStorage.setItem(k, JSON.stringify(data[k]));
+      });
+      onDone(true);
+    } catch { onDone(false); }
+  };
+  r.readAsText(file);
+}
+
+// ═══════════════════════════════════════════════════════
+// THEME & CONSTANTS
+// ═══════════════════════════════════════════════════════
+const T = {
+  bg: "#FAF6F1",
+  bg2: "#F5EDE3",
+  bg3: "#EDE0D0",
+  card: "#FFFCF8",
+  border: "#E0CEBC",
+  border2: "#D4BAA0",
+  accent: "#B8860B",
+  accent2: "#C8966E",
+  accent3: "#A0785A",
+  text: "#3D2B1F",
+  text2: "#6B4E37",
+  text3: "#9A7B65",
+  muted: "#C4A882",
+  pink: "#E8B4B8",
+  green: "#A8C5A0",
+  blue: "#A8B8C8",
+  yellow: "#E8D4A0",
+  red: "#D4847C",
+};
+
+const MOODS = ["😊","😄","😌","😐","😢","😤","😴","🥰","😰","🤩"];
+const MOOD_LABELS = ["開心","超開心","平靜","普通","難過","生氣","疲倦","戀愛","焦慮","興奮"];
+const MOOD_COLORS = [T.yellow, "#FFE0A0", "#C8D8C0", "#D4C4B8", T.blue, T.red, T.bg3, T.pink, "#D4B8D4", "#FFD4A0"];
+
+const DAYS = ["一","二","三","四","五","六","日"];
+const MONTHS = ["1月","2月","3月","4月","5月","6月","7月","8月","9月","10月","11月","12月"];
+
+const now = new Date();
+const CY = now.getFullYear();
+const CM = now.getMonth();
+const CD = now.getDate();
+
+function fmt(d) {
+  const dt = new Date(d);
+  return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,"0")}-${String(dt.getDate()).padStart(2,"0")}`;
+}
+function fmtTime(d) {
+  const dt = new Date(d);
+  return `${String(dt.getHours()).padStart(2,"0")}:${String(dt.getMinutes()).padStart(2,"0")}`;
+}
+function uuid() { return Math.random().toString(36).slice(2) + Date.now().toString(36); }
+
+// ═══════════════════════════════════════════════════════
+// UI COMPONENTS
+// ═══════════════════════════════════════════════════════
+const Btn = ({ children, onClick, style={}, variant="primary", small=false }) => {
+  const base = {
+    border: "none", borderRadius: 12, cursor: "pointer",
+    fontFamily: "inherit", fontWeight: 600, transition: "all 0.15s",
+    padding: small ? "6px 14px" : "10px 20px",
+    fontSize: small ? 13 : 14,
+  };
+  const variants = {
+    primary: { background: T.accent2, color: "#fff" },
+    secondary: { background: T.bg3, color: T.text2, border: `1px solid ${T.border2}` },
+    danger: { background: T.red, color: "#fff" },
+    ghost: { background: "transparent", color: T.text2, border: `1px solid ${T.border}` },
+  };
+  return <button onClick={onClick} style={{...base,...variants[variant],...style}}>{children}</button>;
+};
+
+const Input = ({ value, onChange, placeholder, type="text", style={} }) => (
+  <input
+    type={type} value={value} onChange={e=>onChange(e.target.value)} placeholder={placeholder}
+    style={{
+      width:"100%", padding:"10px 14px", borderRadius:10, border:`1.5px solid ${T.border}`,
+      background:T.card, color:T.text, fontSize:14, fontFamily:"inherit", outline:"none",
+      boxSizing:"border-box", ...style
+    }}
+  />
+);
+
+const Select = ({ value, onChange, options, style={} }) => (
+  <select value={value} onChange={e=>onChange(e.target.value)}
+    style={{
+      width:"100%", padding:"10px 14px", borderRadius:10, border:`1.5px solid ${T.border}`,
+      background:T.card, color:T.text, fontSize:14, fontFamily:"inherit", outline:"none",
+      boxSizing:"border-box", ...style
+    }}>
+    {options.map(o => <option key={o.value||o} value={o.value||o}>{o.label||o}</option>)}
+  </select>
+);
+
+const Textarea = ({ value, onChange, placeholder, rows=3, style={} }) => (
+  <textarea value={value} onChange={e=>onChange(e.target.value)} placeholder={placeholder} rows={rows}
+    style={{
+      width:"100%", padding:"10px 14px", borderRadius:10, border:`1.5px solid ${T.border}`,
+      background:T.card, color:T.text, fontSize:14, fontFamily:"inherit", outline:"none",
+      resize:"vertical", boxSizing:"border-box", ...style
+    }}
+  />
+);
+
+const Card = ({ children, style={} }) => (
+  <div style={{
+    background:T.card, borderRadius:16, padding:"16px",
+    boxShadow:`0 2px 12px rgba(90,55,30,0.08)`, border:`1px solid ${T.border}`,
+    marginBottom:12, ...style
+  }}>{children}</div>
+);
+
+const Modal = ({ open, onClose, title, children }) => {
+  if (!open) return null;
+  return (
+    <div style={{
+      position:"fixed", inset:0, background:"rgba(61,43,31,0.45)", zIndex:1000,
+      display:"flex", alignItems:"flex-end", justifyContent:"center",
+    }} onClick={onClose}>
+      <div onClick={e=>e.stopPropagation()} style={{
+        background:T.bg, borderRadius:"20px 20px 0 0", padding:"20px 20px 32px",
+        width:"100%", maxWidth:480, maxHeight:"85vh", overflowY:"auto",
+        boxShadow:"0 -4px 30px rgba(90,55,30,0.18)",
+      }}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+          <span style={{fontSize:16,fontWeight:700,color:T.text}}>{title}</span>
+          <button onClick={onClose} style={{background:"none",border:"none",fontSize:20,cursor:"pointer",color:T.text3}}>✕</button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+};
+
+const SectionTitle = ({ children, right }) => (
+  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+    <h3 style={{margin:0,fontSize:15,fontWeight:700,color:T.text2}}>{children}</h3>
+    {right}
+  </div>
+);
+
+const Tag = ({ label, color=T.bg3 }) => (
+  <span style={{
+    background:color, color:T.text2, borderRadius:8, padding:"2px 8px",
+    fontSize:12, fontWeight:600, display:"inline-block",
+  }}>{label}</span>
+);
+
+const EmptyState = ({ icon, text }) => (
+  <div style={{textAlign:"center",padding:"32px 16px",color:T.muted}}>
+    <div style={{fontSize:32,marginBottom:8}}>{icon}</div>
+    <div style={{fontSize:13}}>{text}</div>
+  </div>
+);
+
+// Reusable colour picker: preset swatches + native colour input
+const PRESET_COLORS = [
+  "#C8966E","#E8B4B8","#A8C5A0","#A8B8C8","#E8D4A0",
+  "#D4847C","#C4A882","#B8A8D4","#A8C8C0","#D4C8A0",
+  "#F4A460","#DEB887","#BC8F8F","#8FBC8F","#87CEEB",
+];
+
+const ColorPicker = ({ value, onChange, label="選擇顏色" }) => {
+  const nativeRef = useRef();
+  return (
+    <div>
+      <div style={{fontSize:12,color:T.text3,marginBottom:8}}>{label}</div>
+      <div style={{display:"flex",flexWrap:"wrap",gap:7,alignItems:"center"}}>
+        {PRESET_COLORS.map(c=>(
+          <div key={c} onClick={()=>onChange(c)} style={{
+            width:26,height:26,borderRadius:"50%",background:c,cursor:"pointer",
+            border: value===c ? `3px solid ${T.text}` : `2px solid ${T.border}`,
+            boxShadow: value===c ? "0 0 0 2px white inset" : "none",
+            flexShrink:0,transition:"transform 0.1s",
+          }} />
+        ))}
+        {/* Custom colour via native picker */}
+        <div onClick={()=>nativeRef.current.click()} style={{
+          width:26,height:26,borderRadius:"50%",cursor:"pointer",flexShrink:0,
+          background: PRESET_COLORS.includes(value) ? "conic-gradient(red,yellow,lime,cyan,blue,magenta,red)" : value,
+          border: !PRESET_COLORS.includes(value) ? `3px solid ${T.text}` : `2px solid ${T.border}`,
+          boxShadow: !PRESET_COLORS.includes(value) ? "0 0 0 2px white inset" : "none",
+          display:"flex",alignItems:"center",justifyContent:"center",
+          fontSize:13,
+        }}>
+          {PRESET_COLORS.includes(value) && <span style={{fontSize:13,pointerEvents:"none"}}>＋</span>}
+        </div>
+        <input ref={nativeRef} type="color" value={value||"#C8966E"}
+          onChange={e=>onChange(e.target.value)}
+          style={{position:"absolute",opacity:0,width:0,height:0,pointerEvents:"none"}} />
+        {/* Show current custom colour as hex */}
+        {!PRESET_COLORS.includes(value) && (
+          <span style={{fontSize:11,color:T.text3,fontFamily:"monospace"}}>{value}</span>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// ═══════════════════════════════════════════════════════
+// ㈠ 手帳本
+// ═══════════════════════════════════════════════════════
+
+// 週手帳：心情記錄
+function WeekDiary({ data, setData }) {
+  const [modal, setModal] = useState(false);
+  const [edit, setEdit] = useState(null);
+  const [form, setForm] = useState({ date: fmt(new Date()), mood: 0, note: "" });
+  const [weekOffset, setWeekOffset] = useState(0); // 0 = this week, -1 = last week, etc.
+
+  // Compute week days based on offset
+  const getWeekDays = (offset) => {
+    const today = new Date();
+    const dow = today.getDay();
+    // Convert Sun=0 to Mon=0 (Mon=0, Tue=1, ..., Sun=6)
+    const mondayOffset = (dow + 6) % 7;
+    return Array.from({length:7}, (_,i) => {
+      const d = new Date(today);
+      d.setDate(today.getDate() - mondayOffset + i + offset * 7);
+      return d;
+    });
+  };
+
+  const weekDays = getWeekDays(weekOffset);
+  const weekStart = weekDays[0];
+  const weekEnd = weekDays[6];
+
+  const weekLabel = (() => {
+    if (weekOffset === 0) return "本週";
+    if (weekOffset === -1) return "上週";
+    if (weekOffset === 1) return "下週";
+    const m = weekStart.getMonth()+1;
+    const d = weekStart.getDate();
+    const m2 = weekEnd.getMonth()+1;
+    const d2 = weekEnd.getDate();
+    return `${m}/${d} ~ ${m2}/${d2}`;
+  })();
+
+  const open = (existing=null, date=null) => {
+    if (existing) {
+      setEdit(existing.id);
+      setForm({ date: existing.date, mood: existing.mood ?? null, note: existing.note });
+    } else {
+      setEdit(null);
+      setForm({ date: date ? fmt(date) : fmt(new Date()), mood: null, note: "" });
+    }
+    setModal(true);
+  };
+
+  const save = () => {
+    // Allow saving with no mood if there's a note, or just mood, or both
+    if (form.mood === null && !form.note.trim()) return;
+    if (edit) {
+      setData(data.map(d => d.id===edit ? {...d,...form} : d));
+    } else {
+      setData([...data, { id:uuid(), ...form }]);
+    }
+    setModal(false);
+  };
+
+  const del = (id) => setData(data.filter(d=>d.id!==id));
+
+  // Use date strings for comparison to avoid timezone issues
+  const weekStartStr = fmt(weekStart);
+  const weekEndStr = fmt(weekEnd);
+
+  // Recent entries: show entries from the current displayed week
+  const weekEntries = [...data]
+    .filter(e => e.date >= weekStartStr && e.date <= weekEndStr)
+    .sort((a,b) => b.date > a.date ? 1 : -1);
+
+  return (
+    <div>
+      {/* Week navigation */}
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}>
+        <Btn small variant="ghost" onClick={()=>setWeekOffset(o=>o-1)}>‹</Btn>
+        <span style={{flex:1,textAlign:"center",fontWeight:700,color:T.text,fontSize:14}}>
+          {weekLabel}
+          <span style={{fontSize:11,color:T.muted,marginLeft:6,fontWeight:400}}>
+            {weekStart.getMonth()+1}/{weekStart.getDate()} – {weekEnd.getMonth()+1}/{weekEnd.getDate()}
+          </span>
+        </span>
+        <Btn small variant="ghost" onClick={()=>setWeekOffset(o=>o+1)}>›</Btn>
+        {weekOffset !== 0 && (
+          <Btn small variant="secondary" onClick={()=>setWeekOffset(0)}>回本週</Btn>
+        )}
+      </div>
+
+      {/* Week grid */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:4,marginBottom:16}}>
+        {weekDays.map((d,i) => {
+          const ds = fmt(d);
+          const entry = data.find(x=>x.date===ds);
+          const isToday = d.getDate()===CD && d.getMonth()===CM && d.getFullYear()===CY;
+          return (
+            <div key={i} onClick={()=>entry ? open(entry) : open(null,d)}
+              style={{
+                textAlign:"center", cursor:"pointer", borderRadius:12, padding:"8px 2px",
+                background: entry ? (entry.mood!==null&&entry.mood!==undefined ? MOOD_COLORS[entry.mood] : T.bg3) : T.bg2,
+                border: isToday ? `2px solid ${T.accent2}` : `1px solid ${T.border}`,
+                transition:"all 0.15s",
+              }}>
+              <div style={{fontSize:10,color:T.text3,fontWeight:600}}>{DAYS[i]}</div>
+              <div style={{fontSize:11,color:T.text2,marginBottom:2}}>{d.getDate()}</div>
+              <div style={{fontSize:18}}>{entry ? (entry.mood!==null&&entry.mood!==undefined ? MOODS[entry.mood] : "📝") : "·"}</div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Entries this week */}
+      <SectionTitle right={<Btn small onClick={()=>open()}>+ 新增</Btn>}>📝 本週記錄</SectionTitle>
+      {weekEntries.length===0
+        ? <EmptyState icon="🌸" text={weekOffset===0?"點日期格或「+ 新增」記錄心情":"這週沒有心情記錄"} />
+        : weekEntries.map(entry => (
+          <Card key={entry.id} style={{background:(entry.mood!==null&&entry.mood!==undefined?MOOD_COLORS[entry.mood]:T.bg2)+"88"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+              <div>
+                <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+                  <span style={{fontSize:22}}>{entry.mood!==null&&entry.mood!==undefined ? MOODS[entry.mood] : "📝"}</span>
+                  <div>
+                    <div style={{fontSize:13,fontWeight:600,color:T.text}}>{entry.date.replace(/-/g,"/")}</div>
+                    {entry.mood!==null&&entry.mood!==undefined &&
+                      <Tag label={MOOD_LABELS[entry.mood]} color={MOOD_COLORS[entry.mood]} />}
+                  </div>
+                </div>
+                {entry.note && <p style={{margin:0,fontSize:13,color:T.text2,lineHeight:1.5}}>{entry.note}</p>}
+              </div>
+              <div style={{display:"flex",gap:6}}>
+                <Btn small variant="ghost" onClick={()=>open(entry)}>編輯</Btn>
+                <Btn small variant="danger" onClick={()=>del(entry.id)}>刪</Btn>
+              </div>
+            </div>
+          </Card>
+        ))
+      }
+
+      <Modal open={modal} onClose={()=>setModal(false)} title={edit?"編輯心情":"新增心情"}>
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          <Input type="date" value={form.date} onChange={v=>setForm({...form,date:v})} />
+          <div>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+              <span style={{fontSize:13,color:T.text3}}>今天的心情（可不選）</span>
+              {form.mood !== null && (
+                <button onClick={()=>setForm({...form,mood:null})} style={{
+                  background:"none",border:"none",cursor:"pointer",fontSize:12,
+                  color:T.muted,fontFamily:"inherit",
+                }}>✕ 不選心情</button>
+              )}
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:6}}>
+              {MOODS.map((m,i) => (
+                <div key={i} onClick={()=>setForm({...form,mood:form.mood===i?null:i})}
+                  style={{
+                    textAlign:"center", cursor:"pointer", padding:"8px 4px", borderRadius:10,
+                    background: form.mood===i ? MOOD_COLORS[i] : T.bg2,
+                    border: form.mood===i ? `2px solid ${T.accent2}` : `1px solid ${T.border}`,
+                    opacity: form.mood!==null && form.mood!==i ? 0.5 : 1,
+                  }}>
+                  <div style={{fontSize:22}}>{m}</div>
+                  <div style={{fontSize:10,color:T.text3}}>{MOOD_LABELS[i]}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+          <Textarea value={form.note} onChange={v=>setForm({...form,note:v})} placeholder="今天發生了什麼...（可選）" />
+          <Btn onClick={save}>儲存</Btn>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+// 月概覽：月曆 + 心情統計長條圖
+function MonthOverview({ data }) {
+  const [year, setYear] = useState(CY);
+  const [month, setMonth] = useState(CM);
+
+  const monthData = data.filter(d => {
+    if (!d.date) return false;
+    const [y, m] = d.date.split("-").map(Number);
+    return y === year && m === (month + 1);
+  });
+
+  // Build a map: dateStr -> mood index
+  const moodMap = {};
+  monthData.forEach(d => { moodMap[d.date] = d.mood; });
+
+  const firstDay = (new Date(year, month, 1).getDay() + 6) % 7;
+  const daysInMonth = new Date(year, month+1, 0).getDate();
+  const cells = Array(firstDay).fill(null).concat(Array.from({length:daysInMonth},(_,i)=>i+1));
+
+  const counts = Array(10).fill(0);
+  monthData.forEach(d => counts[d.mood]++);
+  const total = monthData.length || 1;
+
+  return (
+    <div>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}>
+        <Btn small variant="ghost" onClick={()=>{if(month===0){setMonth(11);setYear(y=>y-1);}else setMonth(m=>m-1);}}>‹</Btn>
+        <span style={{flex:1,textAlign:"center",fontWeight:700,color:T.text}}>{year}年 {MONTHS[month]}</span>
+        <Btn small variant="ghost" onClick={()=>{if(month===11){setMonth(0);setYear(y=>y+1);}else setMonth(m=>m+1);}}>›</Btn>
+      </div>
+
+      {/* 月曆 */}
+      <Card style={{marginBottom:12}}>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:2,marginBottom:4}}>
+          {DAYS.map(d=><div key={d} style={{textAlign:"center",fontSize:10,color:T.text3,padding:"2px 0",fontWeight:600}}>{d}</div>)}
+          {cells.map((day,i)=>{
+            if (!day) return <div key={i} />;
+            const ds = `${year}-${String(month+1).padStart(2,"0")}-${String(day).padStart(2,"0")}`;
+            const moodIdx = moodMap[ds];
+            const hasMood = moodIdx !== undefined;
+            const isToday = day===CD && month===CM && year===CY;
+            return (
+              <div key={i} style={{
+                position:"relative", textAlign:"center", borderRadius:8, padding:"5px 2px 3px",
+                background: hasMood ? MOOD_COLORS[moodIdx]+"AA" : T.bg2,
+                border: isToday ? `2px solid ${T.accent2}` : `1px solid ${T.border}`,
+                minHeight:36,
+              }}>
+                <div style={{fontSize:11,color:T.text2,fontWeight:isToday?700:400,marginBottom:1}}>{day}</div>
+                {hasMood && (
+                  <div style={{
+                    position:"absolute",top:2,right:3,fontSize:13,lineHeight:1,
+                  }}>{MOODS[moodIdx]}</div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+        <div style={{fontSize:12,color:T.text3,marginTop:6}}>共記錄 {monthData.length} 天</div>
+      </Card>
+
+      {/* 橫式長條統計圖 */}
+      <Card>
+        <div style={{fontSize:13,fontWeight:700,color:T.text2,marginBottom:10}}>📊 心情統計</div>
+        {MOODS.map((m,i) => counts[i]>0 && (
+          <div key={i} style={{marginBottom:8}}>
+            <div style={{display:"flex",justifyContent:"space-between",fontSize:12,marginBottom:3,alignItems:"center"}}>
+              <span style={{display:"flex",alignItems:"center",gap:4}}><span style={{fontSize:16}}>{m}</span>{MOOD_LABELS[i]}</span>
+              <span style={{color:T.text3}}>{counts[i]}天 ({Math.round(counts[i]/total*100)}%)</span>
+            </div>
+            <div style={{height:14,background:T.bg3,borderRadius:7,overflow:"hidden"}}>
+              <div style={{
+                height:"100%", width:`${counts[i]/total*100}%`,
+                background:MOOD_COLORS[i], borderRadius:7, transition:"width 0.5s",
+                border:`1px solid ${T.border}`,
+              }} />
+            </div>
+          </div>
+        ))}
+        {monthData.length===0 && <EmptyState icon="📊" text="這個月還沒有記錄" />}
+      </Card>
+    </div>
+  );
+}
+
+// 打卡牆
+function HabitWall({ data, setData }) {
+  const [year, setYear] = useState(CY);
+  const [month, setMonth] = useState(CM);
+  const [habitModal, setHabitModal] = useState(false);
+  const [newHabit, setNewHabit] = useState("");
+
+  const key = `${year}-${String(month+1).padStart(2,"0")}`;
+  const habits = data.habits || {};
+  const checks = data.checks || {};
+
+  const monthHabits = habits[key] || [];
+  const daysInMonth = new Date(year, month+1, 0).getDate();
+
+  const toggle = (habit, day) => {
+    const ckey = `${key}-${habit}-${day}`;
+    setData({ ...data, checks: { ...checks, [ckey]: !checks[ckey] } });
+  };
+
+  const addHabit = () => {
+    if (!newHabit.trim()) return;
+    setData({ ...data, habits: { ...habits, [key]: [...monthHabits, newHabit.trim()] } });
+    setNewHabit("");
+    setHabitModal(false);
+  };
+
+  const delHabit = (h) => {
+    setData({ ...data, habits: { ...habits, [key]: monthHabits.filter(x=>x!==h) } });
+  };
+
+  return (
+    <div>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:16}}>
+        <Btn small variant="ghost" onClick={()=>{if(month===0){setMonth(11);setYear(y=>y-1);}else setMonth(m=>m-1);}}>‹</Btn>
+        <span style={{flex:1,textAlign:"center",fontWeight:700,color:T.text}}>{year}年 {MONTHS[month]}</span>
+        <Btn small variant="ghost" onClick={()=>{if(month===11){setMonth(0);setYear(y=>y+1);}else setMonth(m=>m+1);}}>›</Btn>
+      </div>
+      <div style={{display:"flex",justifyContent:"flex-end",marginBottom:12}}>
+        <Btn small onClick={()=>setHabitModal(true)}>+ 新增習慣</Btn>
+      </div>
+
+      {monthHabits.length===0 ? <EmptyState icon="✅" text="新增這個月的打卡習慣吧！" /> : (
+        <div style={{overflowX:"auto"}}>
+          <table style={{borderCollapse:"collapse",width:"100%",minWidth:360}}>
+            <thead>
+              <tr>
+                <th style={{textAlign:"left",padding:"6px 8px",fontSize:12,color:T.text3,width:80}}>習慣</th>
+                {Array.from({length:daysInMonth},(_,i)=>(
+                  <th key={i} style={{
+                    padding:"4px 2px",fontSize:10,color:T.text3,textAlign:"center",
+                    fontWeight: i+1===CD && month===CM && year===CY ? 700 : 400,
+                    color: i+1===CD && month===CM && year===CY ? T.accent2 : T.text3,
+                  }}>{i+1}</th>
+                ))}
+                <th style={{padding:"4px 6px",fontSize:11,color:T.text3}}>達成</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {monthHabits.map(h => {
+                const done = Array.from({length:daysInMonth},(_,i)=>checks[`${key}-${h}-${i+1}`]).filter(Boolean).length;
+                return (
+                  <tr key={h} style={{borderTop:`1px solid ${T.border}`}}>
+                    <td style={{padding:"6px 8px",fontSize:12,color:T.text,fontWeight:600}}>{h}</td>
+                    {Array.from({length:daysInMonth},(_,i)=>(
+                      <td key={i} onClick={()=>toggle(h,i+1)}
+                        style={{padding:"4px 2px",textAlign:"center",cursor:"pointer"}}>
+                        <div style={{
+                          width:16,height:16,borderRadius:4,margin:"0 auto",
+                          background: checks[`${key}-${h}-${i+1}`] ? T.accent2 : T.bg3,
+                          border:`1px solid ${T.border}`,
+                          display:"flex",alignItems:"center",justifyContent:"center",
+                          fontSize:10,color:"#fff",
+                        }}>
+                          {checks[`${key}-${h}-${i+1}`] ? "✓" : ""}
+                        </div>
+                      </td>
+                    ))}
+                    <td style={{padding:"4px 6px",textAlign:"center",fontSize:12,color:T.accent3,fontWeight:700}}>
+                      {done}/{daysInMonth}
+                    </td>
+                    <td>
+                      <button onClick={()=>delHabit(h)} style={{
+                        background:"none",border:"none",cursor:"pointer",color:T.muted,fontSize:14
+                      }}>✕</button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <Modal open={habitModal} onClose={()=>setHabitModal(false)} title="新增習慣">
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          <Input value={newHabit} onChange={setNewHabit} placeholder="例如：早起、運動、讀書..." />
+          <Btn onClick={addHabit}>新增</Btn>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+// 隨手記
+function QuickNotes({ data, setData }) {
+  const [modal, setModal] = useState(false);
+  const [edit, setEdit] = useState(null);
+  const [form, setForm] = useState({ text: "", image: null });
+  const [sizeWarn, setSizeWarn] = useState(false);
+  const fileRef = useRef();
+
+  const open = (item=null) => {
+    if (item) { setEdit(item.id); setForm({ text: item.text, image: item.image||item.imageUrl||null }); }
+    else { setEdit(null); setForm({ text: "", image: null }); }
+    setSizeWarn(false);
+    setModal(true);
+  };
+
+  const handleImg = (e) => {
+    const f = e.target.files[0];
+    if (!f) return;
+    // Warn if image > 800KB (to stay safe within 5MB localStorage limit)
+    if (f.size > 800 * 1024) {
+      setSizeWarn(true);
+    } else {
+      setSizeWarn(false);
+    }
+    const r = new FileReader();
+    r.onload = ev => setForm(fm => ({...fm, image: ev.target.result}));
+    r.readAsDataURL(f);
+    e.target.value = "";
+  };
+
+  const save = () => {
+    if (!form.text.trim() && !form.image) return;
+    const entry = { id: edit||uuid(), text: form.text, image: form.image, ts: new Date().toISOString() };
+    if (edit) setData(data.map(d => d.id===edit ? entry : d));
+    else setData([entry, ...data]);
+    setModal(false);
+  };
+
+  const imgSrc = (item) => item.image || item.imageUrl || null;
+
+  return (
+    <div>
+      <SectionTitle right={<Btn small onClick={()=>open()}>+ 新增</Btn>}>📷 隨手記</SectionTitle>
+      {data.length===0 && <EmptyState icon="📝" text="隨時記錄靈感與生活！" />}
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+        {data.map(item => (
+          <Card key={item.id} style={{margin:0}}>
+            {imgSrc(item) && (
+              <img src={imgSrc(item)}
+                style={{width:"100%",borderRadius:8,marginBottom:8,maxHeight:120,objectFit:"cover"}}
+                onError={e=>{e.target.style.display="none";}} />
+            )}
+            <p style={{margin:"0 0 6px",fontSize:13,color:T.text,lineHeight:1.5}}>{item.text}</p>
+            <div style={{fontSize:11,color:T.muted}}>{new Date(item.ts).toLocaleDateString("zh-TW")}</div>
+            <div style={{display:"flex",gap:4,marginTop:8}}>
+              <Btn small variant="ghost" onClick={()=>open(item)}>編輯</Btn>
+              <Btn small variant="danger" onClick={()=>setData(data.filter(d=>d.id!==item.id))}>刪</Btn>
+            </div>
+          </Card>
+        ))}
+      </div>
+
+      <Modal open={modal} onClose={()=>setModal(false)} title={edit?"編輯隨手記":"新增隨手記"}>
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          {/* Image preview */}
+          {form.image && (
+            <div style={{position:"relative"}}>
+              <img src={form.image} style={{width:"100%",borderRadius:10,maxHeight:200,objectFit:"cover"}} />
+              <button onClick={()=>{setForm(f=>({...f,image:null}));setSizeWarn(false);}} style={{
+                position:"absolute",top:6,right:6,background:"rgba(0,0,0,0.5)",
+                border:"none",borderRadius:"50%",width:26,height:26,cursor:"pointer",
+                color:"#fff",fontSize:14,display:"flex",alignItems:"center",justifyContent:"center",
+              }}>✕</button>
+            </div>
+          )}
+
+          {/* Size warning */}
+          {sizeWarn && (
+            <div style={{background:T.yellow+"55",border:`1px solid ${T.yellow}`,borderRadius:8,
+              padding:"8px 12px",fontSize:12,color:T.text2,lineHeight:1.5}}>
+              ⚠️ 圖片較大，建議定期刪除舊的隨手記，避免儲存空間不足。
+            </div>
+          )}
+
+          {/* Upload buttons */}
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+            <Btn variant="secondary" onClick={()=>{
+              fileRef.current.setAttribute("capture","environment");
+              fileRef.current.click();
+            }}>📷 拍照</Btn>
+            <Btn variant="secondary" onClick={()=>{
+              fileRef.current.removeAttribute("capture");
+              fileRef.current.click();
+            }}>🖼 選圖片</Btn>
+          </div>
+          <input ref={fileRef} type="file" accept="image/*" style={{display:"none"}} onChange={handleImg} />
+
+          <Textarea value={form.text} onChange={v=>setForm(f=>({...f,text:v}))} placeholder="記錄一下..." rows={4} />
+          <Btn onClick={save}>儲存</Btn>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════
+// ㈡ 計畫本
+// ═══════════════════════════════════════════════════════
+
+function TodayTasks({ data, setData }) {
+  const [modal, setModal] = useState(false);
+  const [edit, setEdit] = useState(null);
+  const [form, setForm] = useState({ name:"", date:fmt(new Date()), startTime:"", endTime:"", done:false, typeId:"" });
+
+  // Task types stored persistently
+  const [taskTypes, setTaskTypes] = useStorage("task-types", []);
+  const [typeModal, setTypeModal] = useState(false);
+  const [typeForm, setTypeForm] = useState({ name:"", color: "#C8966E" });
+  const [editTypeId, setEditTypeId] = useState(null);
+
+  const TYPE_PALETTE = [
+    "#C8966E","#E8B4B8","#A8C5A0","#A8B8C8","#E8D4A0",
+    "#D4847C","#C4A882","#B8A8D4","#A8C8C0","#D4C8A0",
+  ];
+
+  const openTask = (item=null) => {
+    if (item) { setEdit(item.id); setForm({name:item.name,date:item.date,startTime:item.startTime||item.time||"",endTime:item.endTime||"",done:item.done,typeId:item.typeId||""}); }
+    else { setEdit(null); setForm({name:"",date:fmt(new Date()),startTime:"",endTime:"",done:false,typeId:""}); }
+    setModal(true);
+  };
+
+  const saveTask = () => {
+    if (!form.name.trim()) return;
+    if (edit) setData(data.map(d=>d.id===edit?{...d,...form}:d));
+    else setData([...data, {id:uuid(),...form}]);
+    setModal(false);
+  };
+
+  const openType = (type=null) => {
+    if (type) { setEditTypeId(type.id); setTypeForm({name:type.name,color:type.color}); }
+    else { setEditTypeId(null); setTypeForm({name:"",color:TYPE_PALETTE[taskTypes.length % TYPE_PALETTE.length]}); }
+    setTypeModal(true);
+  };
+
+  const saveType = () => {
+    if (!typeForm.name.trim()) return;
+    if (editTypeId) setTaskTypes(taskTypes.map(t=>t.id===editTypeId?{...t,...typeForm}:t));
+    else setTaskTypes([...taskTypes, {id:uuid(),...typeForm}]);
+    setTypeModal(false);
+  };
+
+  const delType = (id) => {
+    setTaskTypes(taskTypes.filter(t=>t.id!==id));
+    setData(data.map(d=>d.typeId===id?{...d,typeId:""}:d));
+  };
+
+  const getType = (typeId) => taskTypes.find(t=>t.id===typeId);
+
+  const timeDisplay = (t) => {
+    if (!t.startTime) return null;
+    return t.endTime ? `${t.startTime} ~ ${t.endTime}` : t.startTime;
+  };
+
+  const todayStr = fmt(new Date());
+  const todayTasks = data.filter(t=>t.date===todayStr).sort((a,b)=>(a.startTime||a.time||"")>(b.startTime||b.time||"")?1:-1);
+  const upcoming = data.filter(t=>t.date>todayStr).sort((a,b)=>a.date>b.date?1:(a.startTime||"")>(b.startTime||"")?1:-1).slice(0,5);
+
+  return (
+    <div>
+      {/* Header + type manage */}
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+        <h3 style={{margin:0,fontSize:15,fontWeight:700,color:T.text2}}>✅ 今日任務</h3>
+        <div style={{display:"flex",gap:6}}>
+          <Btn small variant="ghost" onClick={()=>openType()}>⚙️ 管理類型</Btn>
+          <Btn small onClick={()=>openTask()}>+ 新增</Btn>
+        </div>
+      </div>
+
+      {/* Type filter chips */}
+      {taskTypes.length>0 && (
+        <div style={{display:"flex",gap:6,overflowX:"auto",paddingBottom:6,marginBottom:10}}>
+          {taskTypes.map(type=>(
+            <div key={type.id} style={{
+              display:"flex",alignItems:"center",gap:5,padding:"4px 12px",borderRadius:20,flexShrink:0,
+              background:type.color+"33",border:`1.5px solid ${type.color}`,
+            }}>
+              <div style={{width:8,height:8,borderRadius:"50%",background:type.color}} />
+              <span style={{fontSize:12,fontWeight:600,color:T.text2}}>{type.name}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {todayTasks.length===0 ? <EmptyState icon="🌟" text="今天沒有任務，去計劃一下吧！" /> : todayTasks.map(t=>{
+        const type = getType(t.typeId);
+        return (
+          <Card key={t.id} style={{
+            background:t.done?T.bg2:T.card,
+            borderLeft: type ? `4px solid ${type.color}` : `4px solid ${T.border}`,
+          }}>
+            <div style={{display:"flex",alignItems:"center",gap:10}}>
+              <div onClick={()=>setData(data.map(d=>d.id===t.id?{...d,done:!d.done}:d))}
+                style={{
+                  width:22,height:22,borderRadius:6,
+                  border:`2px solid ${type?type.color:t.done?T.accent2:T.border2}`,
+                  background:t.done?(type?type.color:T.accent2):"transparent",
+                  display:"flex",alignItems:"center",justifyContent:"center",
+                  cursor:"pointer",flexShrink:0,
+                }}>
+                {t.done && <span style={{color:"#fff",fontSize:13}}>✓</span>}
+              </div>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontSize:14,fontWeight:600,color:t.done?T.text3:T.text,textDecoration:t.done?"line-through":"none"}}>{t.name}</div>
+                <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap",marginTop:2}}>
+                  {type && (
+                    <span style={{
+                      fontSize:11,fontWeight:600,padding:"1px 8px",borderRadius:10,
+                      background:type.color+"33",color:type.color,
+                    }}>{type.name}</span>
+                  )}
+                  {timeDisplay(t) && <span style={{fontSize:12,color:T.muted}}>⏰ {timeDisplay(t)}</span>}
+                </div>
+              </div>
+              <div style={{display:"flex",gap:4,flexShrink:0}}>
+                <Btn small variant="ghost" onClick={()=>openTask(t)}>編輯</Btn>
+                <Btn small variant="danger" onClick={()=>setData(data.filter(d=>d.id!==t.id))}>刪</Btn>
+              </div>
+            </div>
+          </Card>
+        );
+      })}
+
+      {upcoming.length>0 && <>
+        <SectionTitle>📌 即將到來</SectionTitle>
+        {upcoming.map(t=>{
+          const type = getType(t.typeId);
+          return (
+            <Card key={t.id} style={{borderLeft: type?`4px solid ${type.color}`:`4px solid ${T.border}`}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <div>
+                  <div style={{fontSize:14,fontWeight:600,color:T.text}}>{t.name}</div>
+                  <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap",marginTop:2}}>
+                    {type && <span style={{fontSize:11,fontWeight:600,padding:"1px 8px",borderRadius:10,background:type.color+"33",color:type.color}}>{type.name}</span>}
+                    <span style={{fontSize:12,color:T.muted}}>{t.date.replace(/-/g,"/")}{timeDisplay(t)?` ⏰ ${timeDisplay(t)}`:""}</span>
+                  </div>
+                </div>
+                <div style={{display:"flex",gap:4}}>
+                  <Btn small variant="ghost" onClick={()=>openTask(t)}>編輯</Btn>
+                  <Btn small variant="danger" onClick={()=>setData(data.filter(d=>d.id!==t.id))}>刪</Btn>
+                </div>
+              </div>
+            </Card>
+          );
+        })}
+      </>}
+
+      {/* Task modal */}
+      <Modal open={modal} onClose={()=>setModal(false)} title={edit?"編輯任務":"新增任務"}>
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          <Input value={form.name} onChange={v=>setForm(f=>({...f,name:v}))} placeholder="任務名稱" />
+          <div>
+            <div style={{fontSize:12,color:T.text3,marginBottom:4}}>任務類型（選填）</div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+              <div onClick={()=>setForm(f=>({...f,typeId:""}))}
+                style={{
+                  padding:"5px 14px",borderRadius:20,cursor:"pointer",fontSize:12,fontWeight:600,
+                  background:form.typeId===""?T.accent2+"33":T.bg2,
+                  border:`1.5px solid ${form.typeId===""?T.accent2:T.border}`,
+                  color:form.typeId===""?T.accent3:T.text3,
+                }}>無</div>
+              {taskTypes.map(type=>(
+                <div key={type.id} onClick={()=>setForm(f=>({...f,typeId:type.id}))}
+                  style={{
+                    display:"flex",alignItems:"center",gap:5,padding:"5px 14px",borderRadius:20,cursor:"pointer",
+                    background:form.typeId===type.id?type.color+"44":type.color+"18",
+                    border:`1.5px solid ${form.typeId===type.id?type.color:type.color+"66"}`,
+                    fontSize:12,fontWeight:600,color:T.text,
+                  }}>
+                  <div style={{width:8,height:8,borderRadius:"50%",background:type.color}} />
+                  {type.name}
+                </div>
+              ))}
+              {taskTypes.length===0 && (
+                <span style={{fontSize:12,color:T.muted}}>尚未新增任何類型，可點「管理類型」新增</span>
+              )}
+            </div>
+          </div>
+          <div><div style={{fontSize:12,color:T.text3,marginBottom:4}}>日期</div>
+            <Input type="date" value={form.date} onChange={v=>setForm(f=>({...f,date:v}))} /></div>
+          <div style={{display:"flex",gap:8}}>
+            <div style={{flex:1}}>
+              <div style={{fontSize:12,color:T.text3,marginBottom:4}}>開始時間</div>
+              <Input type="time" value={form.startTime} onChange={v=>setForm(f=>({...f,startTime:v}))} />
+            </div>
+            <div style={{flex:1}}>
+              <div style={{fontSize:12,color:T.text3,marginBottom:4}}>結束時間</div>
+              <Input type="time" value={form.endTime} onChange={v=>setForm(f=>({...f,endTime:v}))} />
+            </div>
+          </div>
+          <Btn onClick={saveTask}>儲存</Btn>
+        </div>
+      </Modal>
+
+      {/* Type management modal */}
+      <Modal open={typeModal} onClose={()=>setTypeModal(false)} title="管理任務類型">
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          {/* Existing types */}
+          {taskTypes.length>0 && (
+            <div style={{marginBottom:4}}>
+              {taskTypes.map(type=>(
+                <div key={type.id} style={{
+                  display:"flex",alignItems:"center",gap:8,padding:"8px 10px",
+                  background:type.color+"22",borderRadius:10,marginBottom:6,
+                  border:`1px solid ${type.color+"55"}`,
+                }}>
+                  <div style={{width:14,height:14,borderRadius:"50%",background:type.color,flexShrink:0}} />
+                  <span style={{flex:1,fontSize:14,fontWeight:600,color:T.text}}>{type.name}</span>
+                  <Btn small variant="ghost" onClick={()=>openType(type)}>編輯</Btn>
+                  <Btn small variant="danger" onClick={()=>delType(type.id)}>刪</Btn>
+                </div>
+              ))}
+            </div>
+          )}
+          {/* Add / edit type form */}
+          <div style={{borderTop:taskTypes.length?`1px solid ${T.border}`:"none",paddingTop:taskTypes.length?12:0}}>
+            <div style={{fontSize:13,color:T.text2,fontWeight:700,marginBottom:8}}>
+              {editTypeId?"編輯類型":"新增類型"}
+            </div>
+            <Input value={typeForm.name} onChange={v=>setTypeForm(f=>({...f,name:v}))} placeholder="類型名稱（例如：學業、打工、個人）" />
+            <div style={{marginTop:10}}>
+              <ColorPicker value={typeForm.color} onChange={c=>setTypeForm(f=>({...f,color:c}))} />
+            </div>
+            <div style={{display:"flex",gap:8,marginTop:12}}>
+              <Btn style={{flex:1}} onClick={saveType}>{editTypeId?"更新":"新增類型"}</Btn>
+              {editTypeId && <Btn variant="ghost" onClick={()=>{setEditTypeId(null);setTypeForm({name:"",color:TYPE_PALETTE[0]});}}>取消</Btn>}
+            </div>
+          </div>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+function MonthCalendar({ tasks }) {
+  const [year, setYear] = useState(CY);
+  const [month, setMonth] = useState(CM);
+  const [sel, setSel] = useState(fmt(new Date()));
+
+  const firstDay = (new Date(year, month, 1).getDay() + 6) % 7;
+  const daysInMonth = new Date(year, month+1, 0).getDate();
+  const cells = Array(firstDay).fill(null).concat(Array.from({length:daysInMonth},(_,i)=>i+1));
+
+  const makeDs = (d) => `${year}-${String(month+1).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
+
+  // Tasks for selected day, sorted by startTime
+  const selTasks = tasks
+    .filter(t => t.date === sel)
+    .sort((a,b) => {
+      const ta = a.startTime || a.time || "";
+      const tb = b.startTime || b.time || "";
+      return ta > tb ? 1 : -1;
+    });
+
+  const hasTimeInfo = selTasks.some(t => t.startTime || t.time);
+  const noTimeTasks = selTasks.filter(t => !t.startTime && !t.time);
+
+  return (
+    <div>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}>
+        <Btn small variant="ghost" onClick={()=>{if(month===0){setMonth(11);setYear(y=>y-1);}else setMonth(m=>m-1);}}>‹</Btn>
+        <span style={{flex:1,textAlign:"center",fontWeight:700,color:T.text}}>{year}年 {MONTHS[month]}</span>
+        <Btn small variant="ghost" onClick={()=>{if(month===11){setMonth(0);setYear(y=>y+1);}else setMonth(m=>m+1);}}>›</Btn>
+      </div>
+
+      {/* Calendar grid */}
+      <Card style={{marginBottom:12}}>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:2,marginBottom:4}}>
+          {DAYS.map(d=><div key={d} style={{textAlign:"center",fontSize:11,color:T.text3,padding:"4px 0",fontWeight:600}}>{d}</div>)}
+          {cells.map((day,i)=>{
+            if (!day) return <div key={i} />;
+            const ds = makeDs(day);
+            const dayTasks = tasks.filter(t=>t.date===ds);
+            const hasTasks = dayTasks.length > 0;
+            const taskCount = dayTasks.length;
+            const isToday = day===CD && month===CM && year===CY;
+            const isSel = ds===sel;
+            return (
+              <div key={i} onClick={()=>setSel(ds)} style={{
+                textAlign:"center", cursor:"pointer", borderRadius:8, padding:"5px 2px 4px",
+                background: isSel ? T.accent2 : isToday ? T.bg3 : "transparent",
+                color: isSel ? "#fff" : T.text,
+                border: isToday && !isSel ? `1.5px solid ${T.accent2}` : "1.5px solid transparent",
+                minHeight: 38,
+              }}>
+                <div style={{fontSize:13,fontWeight:isToday?700:400,marginBottom:2}}>{day}</div>
+                {hasTasks && (
+                  <div style={{
+                    fontSize:9,fontWeight:700,lineHeight:1,
+                    background: isSel ? "rgba(255,255,255,0.3)" : T.accent2+"33",
+                    color: isSel ? "#fff" : T.accent3,
+                    borderRadius:4, padding:"1px 3px", display:"inline-block",
+                  }}>{taskCount}</div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </Card>
+
+      {/* Selected day header */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+        <span style={{fontSize:14,fontWeight:700,color:T.text2}}>
+          {sel.replace(/-/g,"/")} {selTasks.length > 0 ? `· ${selTasks.length} 件事` : ""}
+        </span>
+      </div>
+
+      {selTasks.length === 0 ? (
+        <EmptyState icon="📅" text="這天沒有任務" />
+      ) : (
+        <>
+          {/* Simplified timeline — only tasks with time, sorted */}
+          {hasTimeInfo && (
+            <Card style={{marginBottom:10,paddingBottom:8}}>
+              <div style={{fontSize:12,fontWeight:700,color:T.text3,marginBottom:12}}>🕐 時間軸</div>
+              <div style={{position:"relative"}}>
+                {/* Vertical line */}
+                <div style={{
+                  position:"absolute", left:38, top:6, bottom:6,
+                  width:2, background:T.border, borderRadius:1,
+                }} />
+                {selTasks.filter(t=>t.startTime||t.time).map((t, i) => {
+                  const timeStr = t.startTime || t.time;
+                  return (
+                    <div key={t.id} style={{
+                      display:"flex", alignItems:"flex-start", gap:0,
+                      marginBottom: i < selTasks.filter(x=>x.startTime||x.time).length-1 ? 14 : 0,
+                      position:"relative",
+                    }}>
+                      {/* Time label */}
+                      <div style={{
+                        width:34, flexShrink:0, fontSize:11, color:T.accent3,
+                        fontWeight:700, textAlign:"right", paddingRight:8, paddingTop:4,
+                        lineHeight:1.2, fontVariantNumeric:"tabular-nums",
+                      }}>
+                        {timeStr}
+                      </div>
+                      {/* Dot on the line */}
+                      <div style={{
+                        width:12, height:12, borderRadius:"50%", flexShrink:0,
+                        marginTop:4, marginRight:10,
+                        background: t.done ? T.bg3 : T.accent2,
+                        border: `2px solid ${t.done ? T.border2 : T.accent3}`,
+                        position:"relative", zIndex:1,
+                      }} />
+                      {/* Task card */}
+                      <div style={{
+                        flex:1,
+                        background: t.done ? T.bg2 : T.accent2+"18",
+                        border: `1.5px solid ${t.done ? T.border : T.accent2+"66"}`,
+                        borderRadius:10, padding:"7px 12px",
+                      }}>
+                        <div style={{
+                          fontSize:13, fontWeight:600,
+                          color: t.done ? T.text3 : T.text,
+                          textDecoration: t.done ? "line-through" : "none",
+                          marginBottom: t.endTime ? 2 : 0,
+                        }}>
+                          {t.done ? "✓ " : ""}{t.name}
+                        </div>
+                        {t.endTime && (
+                          <div style={{fontSize:11, color:T.muted}}>
+                            {timeStr} ~ {t.endTime}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </Card>
+          )}
+
+          {/* Tasks without time */}
+          {noTimeTasks.length > 0 && (
+            <>
+              <div style={{fontSize:12,color:T.text3,marginBottom:6,fontWeight:600}}>📌 未指定時間</div>
+              {noTimeTasks.map(t=>(
+                <Card key={t.id} style={{borderLeft:`3px solid ${T.border2}`,marginBottom:6}}>
+                  <div style={{fontSize:14,fontWeight:600,color:t.done?T.text3:T.text,textDecoration:t.done?"line-through":"none"}}>
+                    {t.done?"✓ ":""}{t.name}
+                  </div>
+                </Card>
+              ))}
+            </>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function GoalWall({ data, setData }) {
+  const [modal, setModal] = useState(false);
+  const [nodeModal, setNodeModal] = useState(null);
+  const [edit, setEdit] = useState(null);
+  const [form, setForm] = useState({ name:"", deadline:"", color:T.yellow });
+  const [nodeForm, setNodeForm] = useState({ text:"", done:false });
+
+  const COLORS = [T.yellow, T.pink, T.green, T.blue, "#E8C8A8", "#D4C8E8"];
+
+  const open = (item=null) => {
+    if (item) { setEdit(item.id); setForm({name:item.name,deadline:item.deadline||"",color:item.color||T.yellow}); }
+    else { setEdit(null); setForm({name:"",deadline:"",color:T.yellow}); }
+    setModal(true);
+  };
+
+  const save = () => {
+    if (!form.name.trim()) return;
+    if (edit) setData(data.map(d=>d.id===edit?{...d,...form}:d));
+    else setData([...data,{id:uuid(),...form,nodes:[]}]);
+    setModal(false);
+  };
+
+  const addNode = () => {
+    if (!nodeForm.text.trim()) return;
+    setData(data.map(g=>g.id===nodeModal?{...g,nodes:[...(g.nodes||[]),{id:uuid(),text:nodeForm.text,done:false}]}:g));
+    setNodeForm({text:"",done:false});
+  };
+
+  const toggleNode = (gid,nid) => setData(data.map(g=>g.id===gid?{...g,nodes:(g.nodes||[]).map(n=>n.id===nid?{...n,done:!n.done}:n)}:g));
+  const delNode = (gid,nid) => setData(data.map(g=>g.id===gid?{...g,nodes:(g.nodes||[]).filter(n=>n.id!==nid)}:g));
+
+  return (
+    <div>
+      <SectionTitle right={<Btn small onClick={()=>open()}>+ 新增目標</Btn>}>🎯 目標牆</SectionTitle>
+      {data.length===0 && <EmptyState icon="🌟" text="設定你的目標，一步一步達成！" />}
+      {data.map(g => {
+        const nodes = g.nodes||[];
+        const done = nodes.filter(n=>n.done).length;
+        const prog = nodes.length ? done/nodes.length : 0;
+        return (
+          <Card key={g.id} style={{borderTop:`4px solid ${g.color||T.yellow}`}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
+              <div>
+                <div style={{fontSize:15,fontWeight:700,color:T.text}}>{g.name}</div>
+                {g.deadline && <div style={{fontSize:12,color:T.muted}}>截止：{g.deadline}</div>}
+              </div>
+              <div style={{display:"flex",gap:4}}>
+                <Btn small variant="ghost" onClick={()=>open(g)}>編輯</Btn>
+                <Btn small variant="danger" onClick={()=>setData(data.filter(d=>d.id!==g.id))}>刪</Btn>
+              </div>
+            </div>
+            {nodes.length>0 && (
+              <div style={{marginBottom:8}}>
+                <div style={{display:"flex",justifyContent:"space-between",fontSize:12,color:T.text3,marginBottom:4}}>
+                  <span>進度</span><span>{done}/{nodes.length}</span>
+                </div>
+                <div style={{height:8,background:T.bg3,borderRadius:4,overflow:"hidden"}}>
+                  <div style={{height:"100%",width:`${prog*100}%`,background:g.color||T.yellow,borderRadius:4,transition:"width 0.4s"}} />
+                </div>
+              </div>
+            )}
+            <div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:8}}>
+              {nodes.map(n=>(
+                <div key={n.id} onClick={()=>toggleNode(g.id,n.id)}
+                  style={{
+                    display:"flex",alignItems:"center",gap:4,padding:"4px 10px",borderRadius:20,cursor:"pointer",
+                    background:n.done?(g.color||T.yellow):T.bg2,border:`1px solid ${T.border}`,
+                    fontSize:12,color:T.text,
+                  }}>
+                  <span>{n.done?"✓":""}</span>{n.text}
+                  <span onClick={e=>{e.stopPropagation();delNode(g.id,n.id)}} style={{color:T.muted,marginLeft:2}}>✕</span>
+                </div>
+              ))}
+            </div>
+            <Btn small variant="secondary" onClick={()=>setNodeModal(g.id)}>+ 新增節點</Btn>
+          </Card>
+        );
+      })}
+
+      <Modal open={modal} onClose={()=>setModal(false)} title={edit?"編輯目標":"新增目標"}>
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          <Input value={form.name} onChange={v=>setForm(f=>({...f,name:v}))} placeholder="目標名稱" />
+          <Input type="date" value={form.deadline} onChange={v=>setForm(f=>({...f,deadline:v}))} />
+          <ColorPicker value={form.color||T.yellow} onChange={c=>setForm(f=>({...f,color:c}))} label="主題顏色" />
+          <Btn onClick={save}>儲存</Btn>
+        </div>
+      </Modal>
+
+      <Modal open={!!nodeModal} onClose={()=>setNodeModal(null)} title="新增節點">
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          <Input value={nodeForm.text} onChange={v=>setNodeForm(f=>({...f,text:v}))} placeholder="節點名稱" />
+          <Btn onClick={addNode}>新增</Btn>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+function ProjectLog({ data, setData }) {
+  const [modal, setModal] = useState(false);
+  const [edit, setEdit] = useState(null);
+  const [form, setForm] = useState({ name:"", desc:"", files:[], links:[] });
+  const [sel, setSel] = useState(null);
+  const [newLink, setNewLink] = useState("");
+  const fileRef = useRef();
+
+  const open = (item=null) => {
+    if (item) { setEdit(item.id); setForm({name:item.name,desc:item.desc||"",files:item.files||[],links:item.links||[]}); }
+    else { setEdit(null); setForm({name:"",desc:"",files:[],links:[]}); }
+    setModal(true);
+  };
+
+  const save = () => {
+    if (!form.name.trim()) return;
+    if (edit) setData(data.map(d=>d.id===edit?{...d,name:form.name,desc:form.desc,files:form.files,links:form.links}:d));
+    else setData([...data,{id:uuid(),name:form.name,desc:form.desc,files:[],links:form.links,ts:new Date().toISOString()}]);
+    setModal(false);
+  };
+
+  const addLinkToForm = () => {
+    if (!newLink.trim()) return;
+    setForm(f=>({...f, links:[...f.links, {id:uuid(), url:newLink.trim()}]}));
+    setNewLink("");
+  };
+
+  const addLinkToProject = (pid) => {
+    if (!newLink.trim()) return;
+    setData(data.map(d=>d.id===pid?{...d,links:[...(d.links||[]),{id:uuid(),url:newLink.trim()}]}:d));
+    setNewLink("");
+  };
+
+  const delLink = (pid, lid) => {
+    setData(data.map(d=>d.id===pid?{...d,links:(d.links||[]).filter(l=>l.id!==lid)}:d));
+  };
+
+  const fmtLink = (url) => {
+    try { return new URL(url.startsWith("http")?url:"https://"+url).hostname; }
+    catch { return url.length>30?url.slice(0,30)+"…":url; }
+  };
+
+  const proj = sel ? data.find(d=>d.id===sel) : null;
+
+  return (
+    <div>
+      {sel ? (
+        <>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}>
+            <Btn small variant="ghost" onClick={()=>setSel(null)}>← 返回</Btn>
+            <span style={{fontSize:15,fontWeight:700,color:T.text,flex:1}}>{proj.name}</span>
+            <Btn small onClick={()=>open(proj)}>編輯</Btn>
+          </div>
+          <Card>
+            <div style={{fontSize:13,color:T.text3,marginBottom:4}}>建立時間：{new Date(proj.ts).toLocaleDateString("zh-TW")}</div>
+            {proj.desc && <p style={{margin:"0 0 10px",fontSize:13,color:T.text2,lineHeight:1.6}}>{proj.desc}</p>}
+
+            {/* Links section */}
+            <SectionTitle>🔗 連結</SectionTitle>
+            <div style={{display:"flex",gap:8,marginBottom:8}}>
+              <input
+                value={newLink}
+                onChange={e=>setNewLink(e.target.value)}
+                onKeyDown={e=>e.key==="Enter"&&addLinkToProject(proj.id)}
+                placeholder="貼上連結..."
+                style={{
+                  flex:1,padding:"8px 12px",borderRadius:10,border:`1.5px solid ${T.border}`,
+                  background:T.card,color:T.text,fontSize:13,fontFamily:"inherit",outline:"none",
+                }}
+              />
+              <Btn small onClick={()=>addLinkToProject(proj.id)}>新增</Btn>
+            </div>
+            {(proj.links||[]).length===0
+              ? <div style={{fontSize:12,color:T.muted,marginBottom:8}}>還沒有連結</div>
+              : (proj.links||[]).map(l=>(
+                <div key={l.id} style={{display:"flex",alignItems:"center",gap:8,padding:"8px 10px",
+                  background:T.bg2,borderRadius:8,marginBottom:4}}>
+                  <span style={{fontSize:14}}>🔗</span>
+                  <a href={l.url.startsWith("http")?l.url:"https://"+l.url}
+                    target="_blank" rel="noopener noreferrer"
+                    style={{flex:1,fontSize:13,color:T.blue,textDecoration:"none",wordBreak:"break-all"}}>
+                    {fmtLink(l.url)}
+                  </a>
+                  <Btn small variant="danger" onClick={()=>delLink(proj.id,l.id)}>刪</Btn>
+                </div>
+              ))
+            }
+
+            {/* Files section */}
+            <SectionTitle right={
+              <Btn small variant="secondary" onClick={()=>fileRef.current.click()}>+ 上傳</Btn>
+            }>📎 檔案</SectionTitle>
+            {(proj.files||[]).length===0 ? <EmptyState icon="📂" text="還沒有檔案" /> :
+              (proj.files||[]).map((f,i)=>(
+                <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",
+                  padding:"8px 10px",background:T.bg2,borderRadius:8,marginBottom:4}}>
+                  <span style={{fontSize:13,color:T.text}}>📄 {f.name}</span>
+                  <Btn small variant="danger" onClick={()=>setData(data.map(d=>d.id===proj.id?{...d,files:(d.files||[]).filter((_,j)=>j!==i)}:d))}>刪</Btn>
+                </div>
+              ))
+            }
+          </Card>
+          <input ref={fileRef} type="file" multiple style={{display:"none"}} onChange={e=>{
+            Array.from(e.target.files).forEach(f=>{
+              setData(prev=>prev.map(d=>d.id===proj.id?{...d,files:[...(d.files||[]),{name:f.name}]}:d));
+            });
+          }} />
+        </>
+      ) : (
+        <>
+          <SectionTitle right={<Btn small onClick={()=>open()}>+ 新增</Btn>}>📁 專案錄</SectionTitle>
+          {data.length===0 && <EmptyState icon="🗂" text="新增你的專案吧！" />}
+          {data.map(p=>(
+            <Card key={p.id} style={{cursor:"pointer"}} onClick={()=>setSel(p.id)}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:15,fontWeight:700,color:T.text}}>{p.name}</div>
+                  {p.desc && <div style={{fontSize:12,color:T.text3,marginTop:2}}>{p.desc}</div>}
+                  <div style={{display:"flex",gap:10,marginTop:4}}>
+                    <span style={{fontSize:12,color:T.muted}}>📎 {(p.files||[]).length} 個檔案</span>
+                    {(p.links||[]).length>0 && <span style={{fontSize:12,color:T.muted}}>🔗 {p.links.length} 個連結</span>}
+                  </div>
+                </div>
+                <div style={{display:"flex",gap:4}} onClick={e=>e.stopPropagation()}>
+                  <Btn small variant="ghost" onClick={()=>open(p)}>編輯</Btn>
+                  <Btn small variant="danger" onClick={()=>setData(data.filter(d=>d.id!==p.id))}>刪</Btn>
+                </div>
+              </div>
+            </Card>
+          ))}
+        </>
+      )}
+      <Modal open={modal} onClose={()=>setModal(false)} title={edit?"編輯專案":"新增專案"}>
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          <Input value={form.name} onChange={v=>setForm(f=>({...f,name:v}))} placeholder="專案名稱" />
+          <Textarea value={form.desc} onChange={v=>setForm(f=>({...f,desc:v}))} placeholder="專案說明（選填）" rows={3} />
+          <div>
+            <div style={{fontSize:12,color:T.text3,marginBottom:6,fontWeight:600}}>🔗 檔案連結（選填）</div>
+            <div style={{display:"flex",gap:8,marginBottom:6}}>
+              <input
+                value={newLink}
+                onChange={e=>setNewLink(e.target.value)}
+                onKeyDown={e=>e.key==="Enter"&&addLinkToForm()}
+                placeholder="貼上連結後按 Enter..."
+                style={{
+                  flex:1,padding:"8px 12px",borderRadius:10,border:`1.5px solid ${T.border}`,
+                  background:T.bg,color:T.text,fontSize:13,fontFamily:"inherit",outline:"none",
+                }}
+              />
+              <Btn small onClick={addLinkToForm}>新增</Btn>
+            </div>
+            {form.links.map(l=>(
+              <div key={l.id} style={{display:"flex",alignItems:"center",gap:6,padding:"6px 10px",
+                background:T.bg2,borderRadius:8,marginBottom:4}}>
+                <span style={{fontSize:13,color:T.blue,flex:1,wordBreak:"break-all"}}>{fmtLink(l.url)}</span>
+                <button onClick={()=>setForm(f=>({...f,links:f.links.filter(x=>x.id!==l.id)}))}
+                  style={{background:"none",border:"none",cursor:"pointer",color:T.muted,fontSize:14}}>✕</button>
+              </div>
+            ))}
+          </div>
+          <Btn onClick={save}>儲存</Btn>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════
+// ㈢ 生活本
+// ═══════════════════════════════════════════════════════
+
+const DEFAULT_EXPENSE_TYPES = ["生活必需品","三餐","文具書籍","其他"];
+const EXPENSE_COLORS = [T.blue, T.yellow, T.green, T.pink, T.accent2+"88", "#D4B8D4", "#A8C8C0", "#E8C8A0"];
+
+function Finance({ data, setData }) {
+  const [modal, setModal] = useState(false);
+  const [edit, setEdit] = useState(null);
+  const [form, setForm] = useState({ item:"", date:new Date().toISOString().slice(0,10), type:"", amount:"" });
+  const [year, setYear] = useState(CY);
+  const [month, setMonth] = useState(CM);
+  const [typeModal, setTypeModal] = useState(false);
+  const [newTypeName, setNewTypeName] = useState("");
+  const [expenseTypes, setExpenseTypes] = useStorage("expense-types", DEFAULT_EXPENSE_TYPES);
+
+  const colorFor = (type) => EXPENSE_COLORS[expenseTypes.indexOf(type) % EXPENSE_COLORS.length] || T.bg3;
+  const [tab, setTab] = useState("月視圖"); // "月視圖" | "趨勢"
+  const [budget, setBudget] = useStorage("finance-budget", "");
+  const [budgetModal, setBudgetModal] = useState(false);
+  const [budgetInput, setBudgetInput] = useState("");
+
+  // Filter by year/month
+  const monthData = data.filter(d=>{
+    if (!d.date) return false;
+    const [y,m] = d.date.split("-").map(Number);
+    return y===year && m===(month+1);
+  });
+  const total = monthData.reduce((s,d)=>s+Number(d.amount||0),0);
+  const budgetNum = Number(budget)||0;
+  const budgetUsed = budgetNum ? Math.min(total/budgetNum*100,100) : 0;
+  const overBudget = budgetNum && total > budgetNum;
+
+  const typeTotals = expenseTypes.map(t=>({
+    type:t, amount: monthData.filter(d=>d.type===t).reduce((s,d)=>s+Number(d.amount||0),0)
+  }));
+
+  // Build last 12 months trend data
+  const trendMonths = Array.from({length:12},(_,i)=>{
+    const d = new Date(CY, CM - 11 + i, 1);
+    const y = d.getFullYear(), m = d.getMonth();
+    const label = `${m+1}月`;
+    const amt = data
+      .filter(x=>{ if(!x.date) return false; const [dy,dm]=x.date.split("-").map(Number); return dy===y&&dm===(m+1); })
+      .reduce((s,x)=>s+Number(x.amount||0),0);
+    return { y, m, label, amt };
+  });
+  const maxTrend = Math.max(...trendMonths.map(t=>t.amt), 1);
+
+  const open = (item=null) => {
+    if (item) { setEdit(item.id); setForm({item:item.item,date:item.date,type:item.type,amount:item.amount}); }
+    else { setEdit(null); setForm({item:"",date:new Date().toISOString().slice(0,10),type:"三餐",amount:""}); }
+    setModal(true);
+  };
+
+  const save = () => {
+    if (!form.item.trim() || !form.amount) return;
+    if (edit) setData(data.map(d=>d.id===edit?{...d,...form}:d));
+    else setData([...data,{id:uuid(),...form}]);
+    setModal(false);
+  };
+
+  const fmtDate = (d) => {
+    if (!d) return "";
+    const [y,m,day] = d.split("-");
+    return `${y}/${m}/${day}`;
+  };
+
+  return (
+    <div>
+      {/* Tab switcher */}
+      <div style={{display:"flex",gap:0,marginBottom:12,background:T.bg3,borderRadius:12,padding:3}}>
+        {["月視圖","趨勢"].map(t=>(
+          <button key={t} onClick={()=>setTab(t)} style={{
+            flex:1,padding:"7px",borderRadius:10,border:"none",cursor:"pointer",
+            background:tab===t?T.card:"transparent",color:tab===t?T.accent3:T.text3,
+            fontFamily:"inherit",fontWeight:700,fontSize:13,transition:"all 0.15s",
+            boxShadow:tab===t?"0 1px 4px rgba(90,55,30,0.12)":"none",
+          }}>{t==="月視圖"?"📅 月視圖":"📈 趨勢"}</button>
+        ))}
+      </div>
+
+      {tab==="趨勢" ? (
+        // ── Trend view ──
+        <div>
+          <Card>
+            <div style={{fontSize:13,fontWeight:700,color:T.text2,marginBottom:16}}>近 12 個月支出趨勢</div>
+            {/* Bar chart */}
+            <div style={{display:"flex",alignItems:"flex-end",gap:4,height:120,marginBottom:8}}>
+              {trendMonths.map((tm,i)=>{
+                const isCurrentMonth = tm.y===CY && tm.m===CM;
+                const barH = tm.amt ? Math.max((tm.amt/maxTrend)*100, 4) : 0;
+                return (
+                  <div key={i} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:3}}>
+                    <div style={{fontSize:9,color:T.accent3,fontWeight:700,visibility:tm.amt?"visible":"hidden"}}>
+                      {tm.amt>=1000?`${(tm.amt/1000).toFixed(1)}k`:tm.amt}
+                    </div>
+                    <div style={{
+                      width:"100%",height:`${barH}%`,minHeight:tm.amt?4:0,
+                      background: isCurrentMonth ? T.accent2 : T.accent2+"66",
+                      borderRadius:"4px 4px 0 0",transition:"height 0.4s",
+                      border: isCurrentMonth?`1.5px solid ${T.accent3}`:"none",
+                    }} />
+                  </div>
+                );
+              })}
+            </div>
+            {/* Month labels */}
+            <div style={{display:"flex",gap:4}}>
+              {trendMonths.map((tm,i)=>(
+                <div key={i} style={{flex:1,textAlign:"center",fontSize:9,color:tm.y===CY&&tm.m===CM?T.accent3:T.text3,fontWeight:tm.y===CY&&tm.m===CM?700:400}}>
+                  {tm.label}
+                </div>
+              ))}
+            </div>
+          </Card>
+
+          {/* Monthly totals list */}
+          <SectionTitle>各月支出</SectionTitle>
+          {[...trendMonths].reverse().filter(tm=>tm.amt>0).map((tm,i)=>(
+            <Card key={i}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <div style={{fontSize:14,fontWeight:600,color:T.text}}>{tm.y}年 {MONTHS[tm.m]}</div>
+                <div style={{fontSize:15,fontWeight:700,color:T.accent3}}>NT$ {tm.amt.toLocaleString()}</div>
+              </div>
+              <div style={{height:6,background:T.bg3,borderRadius:3,marginTop:6,overflow:"hidden"}}>
+                <div style={{height:"100%",width:`${tm.amt/maxTrend*100}%`,background:T.accent2+"99",borderRadius:3}} />
+              </div>
+            </Card>
+          ))}
+          {trendMonths.every(tm=>tm.amt===0) && <EmptyState icon="📈" text="還沒有任何記帳資料" />}
+        </div>
+      ) : (
+        // ── Month view ──
+        <div>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}>
+            <Btn small variant="ghost" onClick={()=>{if(month===0){setMonth(11);setYear(y=>y-1);}else setMonth(m=>m-1);}}>‹</Btn>
+            <span style={{flex:1,textAlign:"center",fontWeight:700,color:T.text}}>{year}年 {MONTHS[month]}</span>
+            <Btn small variant="ghost" onClick={()=>{if(month===11){setMonth(0);setYear(y=>y+1);}else setMonth(m=>m+1);}}>›</Btn>
+          </div>
+
+          {/* Total + budget */}
+          <Card style={{background:overBudget?"#D4847C":T.accent2,border:"none",marginBottom:8}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+              <div>
+                <div style={{color:"rgba(255,255,255,0.8)",fontSize:13}}>本月總支出</div>
+                <div style={{color:"#fff",fontSize:28,fontWeight:700}}>NT$ {total.toLocaleString()}</div>
+              </div>
+              <button onClick={()=>{setBudgetInput(budget);setBudgetModal(true);}} style={{
+                background:"rgba(255,255,255,0.2)",border:"1px solid rgba(255,255,255,0.4)",
+                borderRadius:8,padding:"4px 10px",color:"#fff",cursor:"pointer",fontSize:12,fontFamily:"inherit",
+              }}>
+                {budget?"✏️ 預算":"＋ 預算"}
+              </button>
+            </div>
+            {budgetNum>0 && (
+              <div style={{marginTop:10}}>
+                <div style={{display:"flex",justifyContent:"space-between",fontSize:12,color:"rgba(255,255,255,0.85)",marginBottom:4}}>
+                  <span>{overBudget?"⚠️ 超出預算！":""} NT$ {total.toLocaleString()} / {Number(budget).toLocaleString()}</span>
+                  <span>{Math.round(budgetUsed)}%</span>
+                </div>
+                <div style={{height:8,background:"rgba(255,255,255,0.25)",borderRadius:4,overflow:"hidden"}}>
+                  <div style={{height:"100%",width:`${budgetUsed}%`,background:"rgba(255,255,255,0.85)",borderRadius:4,transition:"width 0.4s"}} />
+                </div>
+              </div>
+            )}
+          </Card>
+
+          {/* Category bars */}
+          <Card>
+            {typeTotals.map((t,i)=>t.amount>0&&(
+              <div key={t.type} style={{marginBottom:10}}>
+                <div style={{display:"flex",justifyContent:"space-between",fontSize:13,marginBottom:4}}>
+                  <span style={{fontWeight:600,color:T.text}}>{t.type}</span>
+                  <span style={{color:T.text3}}>NT$ {t.amount.toLocaleString()} ({total?Math.round(t.amount/total*100):0}%)</span>
+                </div>
+                <div style={{height:10,background:T.bg3,borderRadius:5,overflow:"hidden"}}>
+                  <div style={{height:"100%",width:`${total?t.amount/total*100:0}%`,background:EXPENSE_COLORS[i],borderRadius:5}} />
+                </div>
+              </div>
+            ))}
+            {total===0 && <EmptyState icon="💰" text="這個月還沒有記帳" />}
+          </Card>
+
+          <SectionTitle right={<Btn small onClick={()=>open()}>+ 新增</Btn>}>消費明細</SectionTitle>
+          {monthData.length===0 && <EmptyState icon="🧾" text="還沒有消費記錄" />}
+          {[...monthData].sort((a,b)=>b.date>a.date?1:-1).map(item=>(
+            <Card key={item.id}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <div>
+                  <div style={{fontSize:14,fontWeight:600,color:T.text}}>{item.item}</div>
+                  <div style={{display:"flex",gap:6,marginTop:2,flexWrap:"wrap"}}>
+                    <Tag label={item.type} color={colorFor(item.type)} />
+                    <span style={{fontSize:12,color:T.muted}}>{fmtDate(item.date)}</span>
+                  </div>
+                </div>
+                <div style={{display:"flex",alignItems:"center",gap:6}}>
+                  <span style={{fontSize:15,fontWeight:700,color:T.accent3}}>NT$ {Number(item.amount).toLocaleString()}</span>
+                  <Btn small variant="ghost" onClick={()=>open(item)}>編輯</Btn>
+                  <Btn small variant="danger" onClick={()=>setData(data.filter(d=>d.id!==item.id))}>刪</Btn>
+                </div>
+              </div>
+            </Card>
+          ))}
+        </div>
+      )}
+
+      {/* Add expense modal */}
+      <Modal open={modal} onClose={()=>setModal(false)} title={edit?"編輯記帳":"新增記帳"}>
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          <Input value={form.item} onChange={v=>setForm(f=>({...f,item:v}))} placeholder="花費項目名稱" />
+          <div>
+            <div style={{fontSize:12,color:T.text3,marginBottom:4}}>日期</div>
+            <Input type="date" value={form.date} onChange={v=>setForm(f=>({...f,date:v}))} />
+          </div>
+          <div>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+              <span style={{fontSize:12,color:T.text3}}>消費類型</span>
+              <button onClick={()=>setTypeModal(true)} style={{
+                background:"none",border:"none",cursor:"pointer",fontSize:12,color:T.accent2,fontFamily:"inherit",fontWeight:600
+              }}>⚙️ 管理類型</button>
+            </div>
+            <Select value={form.type} onChange={v=>setForm(f=>({...f,type:v}))} options={expenseTypes} />
+          </div>
+          <Input type="number" value={form.amount} onChange={v=>setForm(f=>({...f,amount:v}))} placeholder="金額 (NT$)" />
+          <Btn onClick={save}>儲存</Btn>
+        </div>
+      </Modal>
+
+      {/* Type management modal */}
+      <Modal open={typeModal} onClose={()=>setTypeModal(false)} title="管理消費類型">
+        <div style={{display:"flex",flexDirection:"column",gap:10}}>
+          {expenseTypes.map((t,i)=>(
+            <div key={i} style={{display:"flex",gap:8,alignItems:"center"}}>
+              <div style={{width:12,height:12,borderRadius:"50%",background:EXPENSE_COLORS[i%EXPENSE_COLORS.length],flexShrink:0}} />
+              <span style={{flex:1,fontSize:14,color:T.text}}>{t}</span>
+              {expenseTypes.length > 1 && (
+                <Btn small variant="danger" onClick={()=>setExpenseTypes(expenseTypes.filter((_,j)=>j!==i))}>刪</Btn>
+              )}
+            </div>
+          ))}
+          <div style={{borderTop:`1px solid ${T.border}`,paddingTop:10,display:"flex",gap:8}}>
+            <Input value={newTypeName} onChange={setNewTypeName} placeholder="新增類型名稱" />
+            <Btn small onClick={()=>{
+              if (!newTypeName.trim() || expenseTypes.includes(newTypeName.trim())) return;
+              setExpenseTypes([...expenseTypes, newTypeName.trim()]);
+              setNewTypeName("");
+            }}>新增</Btn>
+          </div>
+        </div>
+      </Modal>
+
+      {/* Budget modal */}
+      <Modal open={budgetModal} onClose={()=>setBudgetModal(false)} title="設定每月預算">
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          <Input type="number" value={budgetInput} onChange={setBudgetInput} placeholder="每月預算金額 (NT$)" />
+          <Btn onClick={()=>{setBudget(budgetInput);setBudgetModal(false);}}>確認</Btn>
+          {budget && <Btn variant="ghost" onClick={()=>{setBudget("");setBudgetModal(false);}}>移除預算</Btn>}
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+function PeriodTracker({ data, setData }) {
+  const [startModal, setStartModal] = useState(false);
+  const [endModal, setEndModal] = useState(null); // holds item id to end
+  const [editModal, setEditModal] = useState(null);
+  const [startDate, setStartDate] = useState(new Date().toISOString().slice(0,10));
+  const [endDate, setEndDate] = useState("");
+  const [notes, setNotes] = useState("");
+  const [editForm, setEditForm] = useState({start:"",end:"",notes:""});
+
+  const sorted = [...data].sort((a,b)=>b.start>a.start?1:-1);
+
+  const cycles = sorted.length>1 ? sorted.slice(0,-1).map((_,i)=>{
+    const a = new Date(sorted[i+1].start), b = new Date(sorted[i].start);
+    return Math.round((b-a)/(1000*60*60*24));
+  }) : [];
+  const avgCycle = cycles.length ? Math.round(cycles.reduce((s,c)=>s+c,0)/cycles.length) : null;
+
+  const durations = sorted.filter(d=>d.end).map(d=>{
+    const a=new Date(d.start), b=new Date(d.end);
+    return Math.round((b-a)/(1000*60*60*24))+1;
+  });
+  const avgDur = durations.length ? Math.round(durations.reduce((s,c)=>s+c,0)/durations.length) : null;
+
+  let nextPrediction = null;
+  if (sorted.length && avgCycle) {
+    const last = new Date(sorted[0].start);
+    last.setDate(last.getDate()+avgCycle);
+    nextPrediction = last.toLocaleDateString("zh-TW",{year:"numeric",month:"2-digit",day:"2-digit"});
+  }
+
+  const saveStart = () => {
+    if (!startDate) return;
+    setData([...data,{id:uuid(),start:startDate,end:"",notes}]);
+    setStartModal(false); setNotes("");
+  };
+
+  const saveEnd = () => {
+    if (!endDate) return;
+    setData(data.map(d=>d.id===endModal?{...d,end:endDate}:d));
+    setEndModal(null); setEndDate("");
+  };
+
+  const saveEdit = () => {
+    setData(data.map(d=>d.id===editModal?{...d,...editForm}:d));
+    setEditModal(null);
+  };
+
+  const openEdit = (item) => {
+    setEditForm({start:item.start,end:item.end||"",notes:item.notes||""});
+    setEditModal(item.id);
+  };
+
+  const statCards = [
+    {label:"平均週期", value: avgCycle ? `${avgCycle} 天` : "--"},
+    {label:"平均經期長度", value: avgDur ? `${avgDur} 天` : "--"},
+    {label:"預計下次到來", value: nextPrediction||"--", full:true},
+  ];
+
+  return (
+    <div>
+      <SectionTitle right={<Btn small onClick={()=>setStartModal(true)}>🩸 記錄開始</Btn>}>🌸 生理期追蹤</SectionTitle>
+
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
+        {statCards.map((s,i)=>(
+          <Card key={i} style={{textAlign:"center",margin:0,gridColumn:s.full?"1/-1":"auto",padding:"12px 8px"}}>
+            <div style={{fontSize:11,color:T.text3,marginBottom:2}}>{s.label}</div>
+            <div style={{fontSize:17,fontWeight:700,color:T.accent3}}>{s.value}</div>
+          </Card>
+        ))}
+      </div>
+
+      {sorted.length===0 && <EmptyState icon="🌸" text="點「記錄開始」來記錄生理期第一天" />}
+      {sorted.map(item=>{
+        const dur = item.end ? Math.round((new Date(item.end)-new Date(item.start))/(1000*60*60*24))+1 : null;
+        const ongoing = !item.end;
+        return (
+          <Card key={item.id} style={{borderLeft:`3px solid ${ongoing?T.pink:T.border2}`}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+              <div>
+                <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:4}}>
+                  <span style={{fontSize:14,fontWeight:600,color:T.text}}>{item.start}</span>
+                  {item.end && <span style={{fontSize:13,color:T.text3}}>~ {item.end}</span>}
+                  {ongoing && <Tag label="進行中" color={T.pink} />}
+                </div>
+                <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                  {dur && <Tag label={`${dur} 天`} color={T.pink} />}
+                  {ongoing && <Btn small variant="secondary" onClick={()=>{setEndDate(new Date().toISOString().slice(0,10));setEndModal(item.id);}}>記錄結束</Btn>}
+                </div>
+                {item.notes && <p style={{margin:"6px 0 0",fontSize:12,color:T.text3}}>{item.notes}</p>}
+              </div>
+              <div style={{display:"flex",gap:4}}>
+                <Btn small variant="ghost" onClick={()=>openEdit(item)}>編輯</Btn>
+                <Btn small variant="danger" onClick={()=>setData(data.filter(d=>d.id!==item.id))}>刪</Btn>
+              </div>
+            </div>
+          </Card>
+        );
+      })}
+
+      {/* Start Modal */}
+      <Modal open={startModal} onClose={()=>setStartModal(false)} title="記錄生理期開始">
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          <div><div style={{fontSize:13,color:T.text3,marginBottom:4}}>開始日期</div>
+            <Input type="date" value={startDate} onChange={setStartDate} /></div>
+          <Textarea value={notes} onChange={setNotes} placeholder="備註（選填）" rows={2} />
+          <Btn onClick={saveStart}>記錄開始</Btn>
+        </div>
+      </Modal>
+
+      {/* End Modal */}
+      <Modal open={!!endModal} onClose={()=>setEndModal(null)} title="記錄生理期結束">
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          <div><div style={{fontSize:13,color:T.text3,marginBottom:4}}>結束日期</div>
+            <Input type="date" value={endDate} onChange={setEndDate} /></div>
+          <Btn onClick={saveEnd}>確認結束</Btn>
+        </div>
+      </Modal>
+
+      {/* Edit Modal */}
+      <Modal open={!!editModal} onClose={()=>setEditModal(null)} title="編輯紀錄">
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          <div><div style={{fontSize:13,color:T.text3,marginBottom:4}}>開始日期</div>
+            <Input type="date" value={editForm.start} onChange={v=>setEditForm(f=>({...f,start:v}))} /></div>
+          <div><div style={{fontSize:13,color:T.text3,marginBottom:4}}>結束日期</div>
+            <Input type="date" value={editForm.end} onChange={v=>setEditForm(f=>({...f,end:v}))} /></div>
+          <Textarea value={editForm.notes} onChange={v=>setEditForm(f=>({...f,notes:v}))} placeholder="備註" rows={2} />
+          <Btn onClick={saveEdit}>儲存</Btn>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+function Bookmarks({ data, setData }) {
+  const [folderModal, setFolderModal] = useState(false);
+  const [editFolderModal, setEditFolderModal] = useState(null);
+  const [folderName, setFolderName] = useState("");
+  const [openFolder, setOpenFolder] = useStorage("bookmarks-open-folder", null);
+  const [newItem, setNewItem] = useState("");
+  const [newRating, setNewRating] = useState("");
+  const [newStatus, setNewStatus] = useState("");
+  const [editItemId, setEditItemId] = useState(null);
+  const [editItemText, setEditItemText] = useState("");
+  const [editItemRating, setEditItemRating] = useState("");
+  const [editItemStatus, setEditItemStatus] = useState("");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [filterRating, setFilterRating] = useState("全部");
+  const [filterStatus, setFilterStatus] = useState("全部");
+  const [ratingModal, setRatingModal] = useState(false);
+  const [statusModal, setStatusModal] = useState(false);
+  const [folderRatings, setFolderRatings] = useState([]);
+  const [folderStatuses, setFolderStatuses] = useState([]);
+  const inputRef = useRef();
+
+  const folders = data || [];
+  const folder = openFolder ? folders.find(f=>f.id===openFolder) : null;
+
+  useEffect(() => {
+    if (openFolder && !folder) setOpenFolder(null);
+  }, [openFolder, folder]);
+
+  // Normalize ratings: always array of {name, color}
+  const normRatings = (r) => {
+    if (!r || r.length===0) return [{name:"頂級",color:"#FFD700"},{name:"好看",color:"#C8966E"},{name:"普通",color:"#A8C5A0"}];
+    return r.map(x => typeof x==="string" ? {name:x, color:T.accent2} : x);
+  };
+
+  // Normalize statuses: always array of {name, color}
+  const normStatuses = (s) => {
+    if (!s || s.length===0) return [{name:"完成",color:"#A8C5A0"},{name:"未完成",color:"#C4A882"}];
+    return s.map(x => typeof x==="string" ? {name:x, color:T.accent2} : x);
+  };
+
+  useEffect(() => {
+    if (folder) {
+      setFolderRatings(normRatings(folder.ratings));
+      setFolderStatuses(normStatuses(folder.statuses));
+      setSearchQuery("");
+      setFilterRating("全部");
+      setFilterStatus("全部");
+      setNewRating("");
+      setNewStatus("");
+    }
+  }, [openFolder]);
+
+  const addFolder = () => {
+    if (!folderName.trim()) return;
+    const f = {id:uuid(), name:folderName.trim(), items:[],
+      ratings:[{name:"頂級",color:"#FFD700"},{name:"好看",color:"#C8966E"},{name:"普通",color:"#A8C5A0"}],
+      statuses:[{name:"完成",color:"#A8C5A0"},{name:"未完成",color:"#C4A882"}]};
+    setData([...folders, f]);
+    setFolderName(""); setFolderModal(false);
+    setOpenFolder(f.id);
+  };
+
+  const renameFolder = () => {
+    if (!folderName.trim()) return;
+    setData(folders.map(f=>f.id===editFolderModal?{...f,name:folderName.trim()}:f));
+    setEditFolderModal(null); setFolderName("");
+  };
+
+  const delFolder = (id) => {
+    setData(folders.filter(f=>f.id!==id));
+    if (openFolder===id) setOpenFolder(null);
+  };
+
+  const addItem = () => {
+    if (!newItem.trim()) return;
+    setData(folders.map(f=>{
+      if (f.id!==openFolder) return f;
+      const defStatus = normStatuses(f.statuses)[0]?.name || "未完成";
+      return {...f, items:[...f.items, {
+        id:uuid(), text:newItem.trim(),
+        rating: newRating || "",
+        status: newStatus || defStatus,
+        ts: new Date().toISOString()
+      }]};
+    }));
+    setNewItem(""); setNewRating(""); setNewStatus("");
+    setTimeout(()=>inputRef.current?.focus(), 50);
+  };
+
+  const saveEditItem = () => {
+    if (!editItemText.trim()) return;
+    setData(folders.map(f=>f.id===openFolder
+      ? {...f, items:f.items.map(it=>it.id===editItemId
+          ? {...it, text:editItemText.trim(), rating:editItemRating, status:editItemStatus}
+          : it)}
+      : f));
+    setEditItemId(null); setEditItemText(""); setEditItemRating(""); setEditItemStatus("");
+  };
+
+  const toggleStatus = (fid, iid) => {
+    const f = folders.find(x=>x.id===fid);
+    const statNames = normStatuses(f?.statuses).map(s=>s.name);
+    setData(folders.map(fo=>fo.id===fid
+      ? {...fo, items:fo.items.map(it=>{
+          if (it.id!==iid) return it;
+          const idx = statNames.indexOf(it.status);
+          return {...it, status:statNames[(idx+1)%statNames.length]};
+        })}
+      : fo));
+  };
+
+  const delItem = (fid, iid) => {
+    setData(folders.map(f=>f.id===fid?{...f,items:f.items.filter(it=>it.id!==iid)}:f));
+  };
+
+  const getRatingColor = (rName, ratings) => {
+    const found = normRatings(ratings).find(r=>r.name===rName);
+    return found ? {bg:found.color+"33",border:found.color,text:found.color} : {bg:T.bg3,border:T.border2,text:T.text3};
+  };
+
+  const getStatusColor = (sName, statuses) => {
+    const found = normStatuses(statuses).find(s=>s.name===sName);
+    return found?.color || T.muted;
+  };
+
+  // ── Folder interior ──
+  if (openFolder && folder) {
+    const curRatings = normRatings(folder.ratings);
+    const curStatuses = normStatuses(folder.statuses);
+
+    const visible = [...folder.items].reverse().filter(item => {
+      const ms = !searchQuery.trim() || item.text.toLowerCase().includes(searchQuery.toLowerCase());
+      const mr = filterRating==="全部" || item.rating===filterRating || (filterRating==="未分級"&&!item.rating);
+      const mst = filterStatus==="全部" || item.status===filterStatus;
+      return ms && mr && mst;
+    });
+
+    return (
+      <div>
+        {/* Header */}
+        <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:12}}>
+          <Btn small variant="ghost" onClick={()=>setOpenFolder(null)}>← 返回</Btn>
+          <span style={{fontSize:15,fontWeight:700,color:T.text,flex:1}}>📁 {folder.name}</span>
+          <Btn small variant="ghost" onClick={()=>{setFolderStatuses(normStatuses(folder.statuses));setStatusModal(true);}}>⚙️ 狀態</Btn>
+          <Btn small variant="ghost" onClick={()=>{setFolderRatings(normRatings(folder.ratings));setRatingModal(true);}}>⚙️ 分級</Btn>
+        </div>
+
+        {/* Add item */}
+        <Card style={{marginBottom:12,background:T.accent2+"11",border:`1.5px solid ${T.accent2}`}}>
+          <div style={{fontSize:12,color:T.accent3,fontWeight:700,marginBottom:8}}>✏️ 新增到「{folder.name}」</div>
+          <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:8}}>
+            <input ref={inputRef} value={newItem} onChange={e=>setNewItem(e.target.value)}
+              onKeyDown={e=>e.key==="Enter"&&addItem()} placeholder="輸入內容..."
+              style={{flex:1,padding:"10px 14px",borderRadius:10,border:`1.5px solid ${T.border}`,
+                background:T.card,color:T.text,fontSize:14,fontFamily:"inherit",outline:"none",boxSizing:"border-box"}} />
+            <Btn small onClick={addItem}>新增</Btn>
+          </div>
+          {/* Status chips */}
+          {curStatuses.length>0 && (
+            <div style={{marginBottom:6}}>
+              <div style={{fontSize:11,color:T.text3,marginBottom:4}}>狀態</div>
+              <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                {curStatuses.map(s=>(
+                  <button key={s.name} onClick={()=>setNewStatus(newStatus===s.name?"":s.name)} style={{
+                    padding:"3px 10px",borderRadius:16,fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit",
+                    border:`1.5px solid ${newStatus===s.name?s.color:T.border}`,
+                    background:newStatus===s.name?s.color+"33":T.card,
+                    color:newStatus===s.name?s.color:T.text3,
+                  }}>{s.name}</button>
+                ))}
+              </div>
+            </div>
+          )}
+          {/* Rating chips */}
+          {curRatings.length>0 && (
+            <div>
+              <div style={{fontSize:11,color:T.text3,marginBottom:4}}>分級</div>
+              <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                <button onClick={()=>setNewRating("")} style={{
+                  padding:"3px 10px",borderRadius:16,fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit",
+                  border:`1.5px solid ${newRating===""?T.accent2:T.border}`,
+                  background:newRating===""?T.accent2+"22":T.card,color:newRating===""?T.accent3:T.text3,
+                }}>未分級</button>
+                {curRatings.map(r=>{
+                  const col=getRatingColor(r.name,folder.ratings);
+                  return (
+                    <button key={r.name} onClick={()=>setNewRating(r.name)} style={{
+                      padding:"3px 10px",borderRadius:16,fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit",
+                      border:`1.5px solid ${newRating===r.name?col.border:T.border}`,
+                      background:newRating===r.name?col.bg:T.card,color:newRating===r.name?col.text:T.text3,
+                    }}>{r.name}</button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </Card>
+
+        {/* Search */}
+        <div style={{position:"relative",marginBottom:8}}>
+          <span style={{position:"absolute",left:12,top:"50%",transform:"translateY(-50%)",fontSize:14,pointerEvents:"none"}}>🔍</span>
+          <input value={searchQuery} onChange={e=>setSearchQuery(e.target.value)} placeholder="搜尋..."
+            style={{width:"100%",padding:"8px 36px 8px 34px",borderRadius:10,
+              border:`1.5px solid ${searchQuery?T.accent2:T.border}`,background:T.card,color:T.text,
+              fontSize:13,fontFamily:"inherit",outline:"none",boxSizing:"border-box"}} />
+          {searchQuery && <button onClick={()=>setSearchQuery("")} style={{position:"absolute",right:10,top:"50%",
+            transform:"translateY(-50%)",background:"none",border:"none",cursor:"pointer",color:T.muted,fontSize:16}}>✕</button>}
+        </div>
+
+        {/* Filter chips - status */}
+        <div style={{display:"flex",gap:6,overflowX:"auto",paddingBottom:4,marginBottom:6}}>
+          {["全部",...curStatuses.map(s=>s.name)].map(s=>{
+            const color = curStatuses.find(x=>x.name===s)?.color || T.accent2;
+            const active = filterStatus===s;
+            const count = s==="全部"?folder.items.length:folder.items.filter(i=>i.status===s).length;
+            return (
+              <button key={s} onClick={()=>setFilterStatus(s)} style={{
+                padding:"4px 12px",borderRadius:20,flexShrink:0,fontSize:12,fontWeight:600,
+                cursor:"pointer",fontFamily:"inherit",
+                border:`1.5px solid ${active?color:T.border}`,
+                background:active?color+"33":T.card,color:active?color:T.text3,
+              }}>{s} ({count})</button>
+            );
+          })}
+        </div>
+
+        {/* Filter chips - rating */}
+        <div style={{display:"flex",gap:6,overflowX:"auto",paddingBottom:6,marginBottom:10}}>
+          {["全部",...curRatings.map(r=>r.name),"未分級"].map(r=>{
+            const active = filterRating===r;
+            const count = r==="全部"?folder.items.length:r==="未分級"?folder.items.filter(i=>!i.rating).length:folder.items.filter(i=>i.rating===r).length;
+            const col = getRatingColor(r, folder.ratings);
+            return (
+              <button key={r} onClick={()=>setFilterRating(r)} style={{
+                padding:"4px 12px",borderRadius:20,flexShrink:0,fontSize:12,fontWeight:600,
+                cursor:"pointer",fontFamily:"inherit",
+                border:`1.5px solid ${active?(r==="全部"||r==="未分級"?T.accent2:col.border):T.border}`,
+                background:active?(r==="全部"||r==="未分級"?T.accent2+"22":col.bg):T.card,
+                color:active?(r==="全部"||r==="未分級"?T.accent3:col.text):T.text3,
+              }}>{r} ({count})</button>
+            );
+          })}
+        </div>
+
+        {/* Items */}
+        {visible.length===0 && <EmptyState icon="📝" text={searchQuery||filterRating!=="全部"||filterStatus!=="全部"?"沒有符合條件的記錄":"新增第一筆記錄吧！"} />}
+        {visible.map(item=>(
+          <Card key={item.id} style={{marginBottom:6}}>
+            {editItemId===item.id ? (
+              <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                <input value={editItemText} onChange={e=>setEditItemText(e.target.value)}
+                  onKeyDown={e=>e.key==="Enter"&&saveEditItem()} autoFocus
+                  style={{padding:"8px 12px",borderRadius:8,border:`1.5px solid ${T.border}`,
+                    background:T.card,color:T.text,fontSize:14,fontFamily:"inherit",outline:"none"}} />
+                <div style={{fontSize:11,color:T.text3}}>狀態</div>
+                <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                  {curStatuses.map(s=>(
+                    <button key={s.name} onClick={()=>setEditItemStatus(s.name)} style={{
+                      padding:"3px 10px",borderRadius:16,fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit",
+                      border:`1.5px solid ${editItemStatus===s.name?s.color:T.border}`,
+                      background:editItemStatus===s.name?s.color+"33":T.card,
+                      color:editItemStatus===s.name?s.color:T.text3,
+                    }}>{s.name}</button>
+                  ))}
+                </div>
+                <div style={{fontSize:11,color:T.text3}}>分級</div>
+                <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                  <button onClick={()=>setEditItemRating("")} style={{
+                    padding:"3px 10px",borderRadius:16,fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit",
+                    border:`1.5px solid ${editItemRating===""?T.accent2:T.border}`,
+                    background:editItemRating===""?T.accent2+"22":T.card,color:editItemRating===""?T.accent3:T.text3,
+                  }}>未分級</button>
+                  {curRatings.map(r=>{
+                    const col=getRatingColor(r.name,folder.ratings);
+                    return (
+                      <button key={r.name} onClick={()=>setEditItemRating(r.name)} style={{
+                        padding:"3px 10px",borderRadius:16,fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit",
+                        border:`1.5px solid ${editItemRating===r.name?col.border:T.border}`,
+                        background:editItemRating===r.name?col.bg:T.card,color:editItemRating===r.name?col.text:T.text3,
+                      }}>{r.name}</button>
+                    );
+                  })}
+                </div>
+                <div style={{display:"flex",gap:6}}>
+                  <Btn small onClick={saveEditItem}>確認</Btn>
+                  <Btn small variant="ghost" onClick={()=>setEditItemId(null)}>取消</Btn>
+                </div>
+              </div>
+            ) : (
+              <div style={{display:"flex",alignItems:"center",gap:8}}>
+                {/* Status badge - click to cycle */}
+                {(() => {
+                  const sColor = getStatusColor(item.status, folder.statuses);
+                  return (
+                    <div onClick={()=>toggleStatus(openFolder,item.id)} style={{
+                      flexShrink:0,cursor:"pointer",padding:"2px 8px",borderRadius:12,
+                      border:`1.5px solid ${sColor}`,background:sColor+"33",
+                      fontSize:11,fontWeight:700,color:sColor,whiteSpace:"nowrap",
+                    }}>{item.status||curStatuses[0]?.name||""}</div>
+                  );
+                })()}
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontSize:14,color:T.text,lineHeight:1.4,marginBottom:3}}>{item.text}</div>
+                  <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
+                    {item.rating && (()=>{
+                      const col=getRatingColor(item.rating,folder.ratings);
+                      return <span style={{fontSize:11,fontWeight:700,padding:"1px 7px",borderRadius:10,
+                        background:col.bg,border:`1px solid ${col.border}`,color:col.text}}>{item.rating}</span>;
+                    })()}
+                    <span style={{fontSize:11,color:T.muted}}>{new Date(item.ts).toLocaleDateString("zh-TW")}</span>
+                  </div>
+                </div>
+                <div style={{display:"flex",gap:4,flexShrink:0}}>
+                  <Btn small variant="ghost" onClick={()=>{
+                    setEditItemId(item.id);setEditItemText(item.text);
+                    setEditItemRating(item.rating||"");
+                    setEditItemStatus(item.status||curStatuses[0]?.name||"");
+                  }}>編輯</Btn>
+                  <Btn small variant="danger" onClick={()=>delItem(openFolder,item.id)}>刪</Btn>
+                </div>
+              </div>
+            )}
+          </Card>
+        ))}
+
+        {/* Rating Modal */}
+        <Modal open={ratingModal} onClose={()=>setRatingModal(false)} title="管理分級">
+          <div style={{display:"flex",flexDirection:"column",gap:12}}>
+            {folderRatings.map((r,i)=>{
+              const item = typeof r==="string"?{name:r,color:"#C8966E"}:r;
+              return (
+                <div key={i} style={{background:T.bg2,borderRadius:10,padding:"10px 12px"}}>
+                  <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:8}}>
+                    <div style={{width:14,height:14,borderRadius:"50%",background:item.color,flexShrink:0}} />
+                    <input value={item.name}
+                      onChange={e=>{const n=[...folderRatings];n[i]={...item,name:e.target.value};setFolderRatings(n);}}
+                      placeholder="分級名稱"
+                      style={{flex:1,padding:"6px 10px",borderRadius:8,border:`1.5px solid ${T.border}`,
+                        background:T.card,color:T.text,fontSize:13,fontFamily:"inherit",outline:"none"}} />
+                    <Btn small variant="danger" onClick={()=>setFolderRatings(folderRatings.filter((_,j)=>j!==i))}>刪</Btn>
+                  </div>
+                  <ColorPicker value={item.color}
+                    onChange={c=>{const n=[...folderRatings];n[i]={...item,color:c};setFolderRatings(n);}}
+                    label="顏色" />
+                </div>
+              );
+            })}
+            <Btn variant="secondary" onClick={()=>setFolderRatings([...folderRatings,{name:"",color:"#C8966E"}])}>+ 新增分級</Btn>
+            <Btn onClick={()=>{
+              const valid=folderRatings.filter(r=>(typeof r==="string"?r:r.name).trim());
+              setData(folders.map(f=>f.id===openFolder?{...f,ratings:valid}:f));
+              setFolderRatings(valid);
+              setRatingModal(false);
+            }}>儲存</Btn>
+          </div>
+        </Modal>
+
+        {/* Status Modal */}
+        <Modal open={statusModal} onClose={()=>setStatusModal(false)} title="管理狀態">
+          <div style={{display:"flex",flexDirection:"column",gap:12}}>
+            <div style={{fontSize:12,color:T.text3}}>點擊項目的狀態標籤可循環切換</div>
+            {folderStatuses.map((s,i)=>{
+              const item = typeof s==="string"?{name:s,color:T.accent2}:s;
+              return (
+                <div key={i} style={{background:T.bg2,borderRadius:10,padding:"10px 12px"}}>
+                  <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:8}}>
+                    <div style={{width:14,height:14,borderRadius:"50%",background:item.color,flexShrink:0}} />
+                    <input value={item.name}
+                      onChange={e=>{const n=[...folderStatuses];n[i]={...item,name:e.target.value};setFolderStatuses(n);}}
+                      placeholder="狀態名稱"
+                      style={{flex:1,padding:"6px 10px",borderRadius:8,border:`1.5px solid ${T.border}`,
+                        background:T.card,color:T.text,fontSize:13,fontFamily:"inherit",outline:"none"}} />
+                    {folderStatuses.length>1 && (
+                      <Btn small variant="danger" onClick={()=>setFolderStatuses(folderStatuses.filter((_,j)=>j!==i))}>刪</Btn>
+                    )}
+                  </div>
+                  <ColorPicker value={item.color}
+                    onChange={c=>{const n=[...folderStatuses];n[i]={...item,color:c};setFolderStatuses(n);}}
+                    label="顏色" />
+                </div>
+              );
+            })}
+            <Btn variant="secondary" onClick={()=>setFolderStatuses([...folderStatuses,{name:"",color:T.accent2}])}>+ 新增狀態</Btn>
+            <Btn onClick={()=>{
+              const valid=folderStatuses.filter(s=>(typeof s==="string"?s:s.name).trim());
+              setData(folders.map(f=>f.id===openFolder?{...f,statuses:valid}:f));
+              setFolderStatuses(valid);
+              setStatusModal(false);
+            }}>儲存</Btn>
+          </div>
+        </Modal>
+      </div>
+    );
+  }
+
+  // ── Folder list ──
+  return (
+    <div>
+      <SectionTitle right={<Btn small onClick={()=>{setFolderName("");setFolderModal(true);}}>+ 新增資料夾</Btn>}>🔖 收藏夾</SectionTitle>
+      {folders.length===0 && <EmptyState icon="📁" text="新增資料夾來分類收藏內容" />}
+      <div style={{display:"flex",flexDirection:"column",gap:8}}>
+        {folders.map(f=>(
+          <Card key={f.id} style={{margin:0,padding:"14px 16px"}}>
+            <div onClick={()=>setOpenFolder(f.id)} style={{cursor:"pointer",marginBottom:10}}>
+              <div style={{display:"flex",alignItems:"center",gap:10}}>
+                <span style={{fontSize:24}}>📁</span>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:15,fontWeight:700,color:T.text}}>{f.name}</div>
+                  <div style={{fontSize:12,color:T.muted}}>{f.items.length} 筆記錄</div>
+                </div>
+                <span style={{fontSize:18,color:T.accent2}}>›</span>
+              </div>
+            </div>
+            <div style={{display:"flex",gap:6}}>
+              <Btn small style={{flex:1}} onClick={()=>setOpenFolder(f.id)}>📂 開啟資料夾</Btn>
+              <Btn small variant="ghost" onClick={()=>{setFolderName(f.name);setEditFolderModal(f.id);}}>改名</Btn>
+              <Btn small variant="danger" onClick={()=>delFolder(f.id)}>刪</Btn>
+            </div>
+          </Card>
+        ))}
+      </div>
+
+      <Modal open={folderModal} onClose={()=>setFolderModal(false)} title="新增資料夾">
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          <Input value={folderName} onChange={setFolderName} placeholder="資料夾名稱" />
+          <Btn onClick={addFolder}>建立</Btn>
+        </div>
+      </Modal>
+      <Modal open={!!editFolderModal} onClose={()=>setEditFolderModal(null)} title="重新命名">
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          <Input value={folderName} onChange={setFolderName} placeholder="新名稱" />
+          <Btn onClick={renameFolder}>確認</Btn>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+function Memos({ data, setData }) {
+  const [modal, setModal] = useState(false);
+  const [edit, setEdit] = useState(null);
+  const [form, setForm] = useState({ title:"", content:"" });
+
+  const open = (item=null) => {
+    if (item) { setEdit(item.id); setForm({title:item.title,content:item.content}); }
+    else { setEdit(null); setForm({title:"",content:""}); }
+    setModal(true);
+  };
+
+  const [query, setQuery] = useState("");
+
+  const save = () => {
+    if (!form.title.trim()) return;
+    if (edit) setData(data.map(d=>d.id===edit?{...d,...form,updated:new Date().toISOString()}:d));
+    else setData([...data,{id:uuid(),...form,ts:new Date().toISOString()}]);
+    setModal(false);
+  };
+
+  const filtered = query.trim()
+    ? data.filter(d =>
+        d.title.toLowerCase().includes(query.toLowerCase()) ||
+        (d.content||"").toLowerCase().includes(query.toLowerCase())
+      )
+    : data;
+
+  const highlight = (text, q) => {
+    if (!q.trim() || !text) return text;
+    const idx = text.toLowerCase().indexOf(q.toLowerCase());
+    if (idx === -1) return text;
+    return (
+      <>
+        {text.slice(0, idx)}
+        <mark style={{background:T.yellow,borderRadius:3,padding:"0 1px"}}>{text.slice(idx, idx+q.length)}</mark>
+        {text.slice(idx+q.length)}
+      </>
+    );
+  };
+
+  return (
+    <div>
+      <SectionTitle right={<Btn small onClick={()=>open()}>+ 新增</Btn>}>📋 備忘錄</SectionTitle>
+      {/* Search bar */}
+      <div style={{position:"relative",marginBottom:12}}>
+        <span style={{position:"absolute",left:12,top:"50%",transform:"translateY(-50%)",fontSize:15,pointerEvents:"none"}}>🔍</span>
+        <input
+          value={query}
+          onChange={e=>setQuery(e.target.value)}
+          placeholder="搜尋標題或內容..."
+          style={{
+            width:"100%",padding:"9px 14px 9px 36px",borderRadius:12,
+            border:`1.5px solid ${query?T.accent2:T.border}`,
+            background:T.card,color:T.text,fontSize:13,fontFamily:"inherit",
+            outline:"none",boxSizing:"border-box",
+          }}
+        />
+        {query && (
+          <button onClick={()=>setQuery("")} style={{
+            position:"absolute",right:10,top:"50%",transform:"translateY(-50%)",
+            background:"none",border:"none",cursor:"pointer",color:T.muted,fontSize:16,lineHeight:1,
+          }}>✕</button>
+        )}
+      </div>
+      {query && (
+        <div style={{fontSize:12,color:T.text3,marginBottom:8}}>
+          找到 {filtered.length} 筆結果
+        </div>
+      )}
+      {filtered.length===0
+        ? <EmptyState icon={query?"🔍":"📋"} text={query?`找不到「${query}」相關的備忘錄`:"記下重要事項！"} />
+        : [...filtered].sort((a,b)=>b.ts>a.ts?1:-1).map(item=>(
+          <Card key={item.id}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+              <div style={{flex:1}}>
+                <div style={{fontSize:14,fontWeight:700,color:T.text,marginBottom:4}}>
+                  {highlight(item.title, query)}
+                </div>
+                <p style={{margin:"0 0 6px",fontSize:13,color:T.text2,lineHeight:1.6,whiteSpace:"pre-wrap"}}>
+                  {highlight(item.content, query)}
+                </p>
+                <div style={{fontSize:11,color:T.muted}}>{new Date(item.updated||item.ts).toLocaleString("zh-TW")}</div>
+              </div>
+              <div style={{display:"flex",gap:4,marginLeft:8}}>
+                <Btn small variant="ghost" onClick={()=>open(item)}>編輯</Btn>
+                <Btn small variant="danger" onClick={()=>setData(data.filter(d=>d.id!==item.id))}>刪</Btn>
+              </div>
+            </div>
+          </Card>
+        ))
+      }
+      <Modal open={modal} onClose={()=>setModal(false)} title={edit?"編輯備忘錄":"新增備忘錄"}>
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          <Input value={form.title} onChange={v=>setForm(f=>({...f,title:v}))} placeholder="標題" />
+          <Textarea value={form.content} onChange={v=>setForm(f=>({...f,content:v}))} placeholder="內容..." rows={6} />
+          <Btn onClick={save}>儲存</Btn>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════
+// ㈣ 校園本
+// ═══════════════════════════════════════════════════════
+
+const SEMESTERS = ["大一上","大一下","大二上","大二下","大三上","大三下","大四上","大四下"];
+const COURSE_TYPES_DEFAULT = ["必修","專業選修","選修","通識"];
+const WEEKDAYS = ["週一","週二","週三","週四","週五","週六","週日"];
+
+function CourseManagement({ courses, setCourses, gradReq, setGradReq, semester }) {
+  const [modal, setModal] = useState(false);
+  const [edit, setEdit] = useState(null);
+  const [form, setForm] = useState({ name:"", type:"必修", teacher:"", day:"週一", startTime:"", endTime:"", credits:"" });
+  const [reqModal, setReqModal] = useState(false);
+  const [customTypes, setCustomTypes] = useStorage("customCourseTypes", []);
+  const [newType, setNewType] = useState("");
+
+  const allTypes = [...COURSE_TYPES_DEFAULT, ...customTypes];
+  const semCourses = courses.filter(c=>c.semester===semester);
+  const allCourses = courses;
+
+  const open = (item=null) => {
+    if (item) { setEdit(item.id); setForm({name:item.name,type:item.type,teacher:item.teacher||"",day:item.day||"週一",startTime:item.startTime||"",endTime:item.endTime||"",credits:item.credits||""}); }
+    else { setEdit(null); setForm({name:"",type:"必修",teacher:"",day:"週一",startTime:"",endTime:"",credits:""}); }
+    setModal(true);
+  };
+
+  const save = () => {
+    if (!form.name.trim()) return;
+    if (edit) setCourses(courses.map(d=>d.id===edit?{...d,...form}:d));
+    else setCourses([...courses,{id:uuid(),semester,...form}]);
+    setModal(false);
+  };
+
+  // Accumulate credits up to this semester
+  const semIdx = SEMESTERS.indexOf(semester);
+  const pastAndCurrentCourses = allCourses.filter(c=>SEMESTERS.indexOf(c.semester)<=semIdx);
+  const totalAcc = pastAndCurrentCourses.reduce((s,c)=>s+Number(c.credits||0),0);
+  const semTotal = semCourses.reduce((s,c)=>s+Number(c.credits||0),0);
+
+  const typeAcc = allTypes.map(t=>({
+    type:t,
+    semCredits: semCourses.filter(c=>c.type===t).reduce((s,c)=>s+Number(c.credits||0),0),
+    acc: pastAndCurrentCourses.filter(c=>c.type===t).reduce((s,c)=>s+Number(c.credits||0),0),
+    req: gradReq?.types?.[t]||0,
+  }));
+
+  return (
+    <div>
+      <div style={{display:"flex",gap:8,marginBottom:12}}>
+        <Btn small variant="secondary" style={{flex:1}} onClick={()=>setReqModal(true)}>⚙️ 設定學分需求</Btn>
+        <Btn small onClick={()=>open()}>+ 新增課程</Btn>
+      </div>
+
+      <Card style={{marginBottom:12}}>
+        <div style={{fontSize:13,color:T.text3,marginBottom:8,fontWeight:600}}>學分統計</div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:10}}>
+          <div style={{background:T.bg2,borderRadius:10,padding:"10px 12px",textAlign:"center"}}>
+            <div style={{fontSize:11,color:T.text3,marginBottom:2}}>本學期</div>
+            <div style={{fontSize:18,fontWeight:700,color:T.accent2}}>{semTotal} 學分</div>
+          </div>
+          <div style={{background:T.bg2,borderRadius:10,padding:"10px 12px",textAlign:"center"}}>
+            <div style={{fontSize:11,color:T.text3,marginBottom:2}}>累積總計</div>
+            <div style={{fontSize:18,fontWeight:700,color:T.accent3}}>{totalAcc} / {gradReq?.total||"--"}</div>
+          </div>
+        </div>
+        {typeAcc.filter(t=>t.req>0||t.acc>0).map(t=>(
+          <div key={t.type} style={{display:"flex",justifyContent:"space-between",fontSize:13,marginBottom:4,alignItems:"center"}}>
+            <span style={{color:T.text2}}>{t.type}</span>
+            <div style={{display:"flex",gap:8,alignItems:"center"}}>
+              <span style={{fontSize:12,color:T.text3}}>本學期 {t.semCredits}</span>
+              <span style={{color:T.accent3,fontWeight:600}}>{t.acc}{t.req?`/${t.req}`:""}</span>
+            </div>
+          </div>
+        ))}
+      </Card>
+
+      <SectionTitle>{semester} 課程</SectionTitle>
+      {semCourses.length===0 && <EmptyState icon="📚" text="還沒有課程" />}
+      {semCourses.map(c=>(
+        <Card key={c.id}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+            <div>
+              <div style={{fontSize:14,fontWeight:700,color:T.text}}>{c.name}</div>
+              <div style={{display:"flex",gap:6,flexWrap:"wrap",marginTop:4}}>
+                <Tag label={c.type} color={T.bg3} />
+                <Tag label={`${c.credits||0}學分`} color={T.yellow} />
+                {c.teacher && <Tag label={c.teacher} color={T.bg2} />}
+                {c.day && <Tag label={`${c.day} ${c.startTime||""}${c.endTime?`~${c.endTime}`:""}`} color={T.blue} />}
+              </div>
+            </div>
+            <div style={{display:"flex",gap:4}}>
+              <Btn small variant="ghost" onClick={()=>open(c)}>編輯</Btn>
+              <Btn small variant="danger" onClick={()=>setCourses(courses.filter(d=>d.id!==c.id))}>刪</Btn>
+            </div>
+          </div>
+        </Card>
+      ))}
+
+      <Modal open={modal} onClose={()=>setModal(false)} title={edit?"編輯課程":"新增課程"}>
+        <div style={{display:"flex",flexDirection:"column",gap:10}}>
+          <Input value={form.name} onChange={v=>setForm(f=>({...f,name:v}))} placeholder="課程名稱" />
+          <Select value={form.type} onChange={v=>setForm(f=>({...f,type:v}))} options={allTypes} />
+          <Input value={form.teacher} onChange={v=>setForm(f=>({...f,teacher:v}))} placeholder="老師（選填）" />
+          <Select value={form.day} onChange={v=>setForm(f=>({...f,day:v}))} options={WEEKDAYS} />
+          <div style={{display:"flex",gap:8}}>
+            <Input type="time" value={form.startTime} onChange={v=>setForm(f=>({...f,startTime:v}))} style={{flex:1}} />
+            <Input type="time" value={form.endTime} onChange={v=>setForm(f=>({...f,endTime:v}))} style={{flex:1}} />
+          </div>
+          <Input type="number" value={form.credits} onChange={v=>setForm(f=>({...f,credits:v}))} placeholder="學分數" />
+          <Btn onClick={save}>儲存</Btn>
+        </div>
+      </Modal>
+
+      <Modal open={reqModal} onClose={()=>setReqModal(false)} title="設定畢業學分需求">
+        <div style={{display:"flex",flexDirection:"column",gap:10}}>
+          <Input type="number" value={gradReq?.total||""} onChange={v=>setGradReq(r=>({...r,total:v}))} placeholder="畢業總學分" />
+          {allTypes.map(t=>(
+            <div key={t} style={{display:"flex",alignItems:"center",gap:8}}>
+              <span style={{fontSize:13,color:T.text,width:80,flexShrink:0}}>{t}</span>
+              <Input type="number" value={gradReq?.types?.[t]||""} onChange={v=>setGradReq(r=>({...r,types:{...r?.types,[t]:v}}))} placeholder={`${t}需求學分`} />
+            </div>
+          ))}
+          <div style={{borderTop:`1px solid ${T.border}`,paddingTop:10}}>
+            <div style={{fontSize:13,color:T.text3,marginBottom:6}}>新增課程類型</div>
+            <div style={{display:"flex",gap:8}}>
+              <Input value={newType} onChange={setNewType} placeholder="自訂類型名稱" />
+              <Btn small onClick={()=>{if(newType.trim()&&!allTypes.includes(newType.trim())){setCustomTypes([...customTypes,newType.trim()]);setNewType("");}}} style={{flexShrink:0}}>新增</Btn>
+            </div>
+          </div>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+function CourseSchedule({ courses, semester }) {
+  const semCourses = courses.filter(c => c.semester === semester && c.day && c.startTime);
+
+  const toMins = (t) => {
+    if (!t) return null;
+    const [h, m] = t.split(":").map(Number);
+    return h * 60 + (m || 0);
+  };
+
+  // Colour palette — one stable colour per course
+  const COURSE_COLORS = [
+    { bg: T.accent2+"44", border: T.accent2,   text: T.accent3 },
+    { bg: T.blue+"55",    border: "#7090b0",   text: "#3a5a7a" },
+    { bg: T.green+"66",   border: "#70a068",   text: "#2d5a28" },
+    { bg: T.pink+"66",    border: "#c07880",   text: "#7a3040" },
+    { bg: T.yellow+"77",  border: "#b09020",   text: "#6a4a00" },
+    { bg: "#d0b8d855",    border: "#9068a0",   text: "#503060" },
+    { bg: "#b8d4d055",    border: "#508080",   text: "#2a5050" },
+  ];
+  const colorFor = (id) => {
+    const idx = semCourses.findIndex(c => c.id === id);
+    return COURSE_COLORS[idx % COURSE_COLORS.length];
+  };
+
+  if (semCourses.length === 0) {
+    return (
+      <div>
+        <SectionTitle>{semester} 課表</SectionTitle>
+        <EmptyState icon="🗓" text="在課程管理新增課程後即可顯示" />
+      </div>
+    );
+  }
+
+  // ── Fixed full-day range 08:00–22:00 at compressed scale ──
+  // 14 hours × 60 min × 0.55 px ≈ 462px — fits one phone screen without scrolling
+  const HOUR_START  = 8;
+  const HOUR_END    = 22;
+  const PX_PER_MIN  = 0.55;
+  const earliestMin = HOUR_START * 60;
+  const latestMin   = HOUR_END   * 60;
+  const totalMins   = latestMin - earliestMin;
+  const GRID_H      = totalMins * PX_PER_MIN;   // ≈ 462px
+  const TIME_COL_W  = 30;
+
+  // Show all weekdays Mon–Sun (keep empty cols so layout is consistent)
+  const activeDays = WEEKDAYS;   // Mon → Sun, always 7 columns
+
+  // Hour labels within the window
+  const hourLabels = [];
+  for (let m = earliestMin; m <= latestMin; m += 60) hourLabels.push(m / 60);
+
+  return (
+    <div>
+      <SectionTitle>{semester} 課表</SectionTitle>
+
+      {/* Legend: course name → colour chip */}
+      <div style={{ display:"flex", flexWrap:"wrap", gap:4, marginBottom:10 }}>
+        {semCourses.map(c => {
+          const col = colorFor(c.id);
+          return (
+            <div key={c.id} style={{
+              display:"flex", alignItems:"center", gap:4,
+              padding:"2px 8px", borderRadius:20, fontSize:11, fontWeight:600,
+              background: col.bg, border:`1px solid ${col.border}`, color: col.text,
+            }}>
+              {c.name}
+            </div>
+          );
+        })}
+      </div>
+
+      <div style={{ overflowX:"auto" }}>
+        <div style={{ minWidth: TIME_COL_W + activeDays.length * 44 }}>
+
+          {/* Day header */}
+          <div style={{
+            display:"grid",
+            gridTemplateColumns:`${TIME_COL_W}px repeat(${activeDays.length},1fr)`,
+            borderBottom:`1px solid ${T.border}`, marginBottom:2,
+          }}>
+            <div />
+            {activeDays.map(d => (
+              <div key={d} style={{
+                textAlign:"center", fontSize:11, fontWeight:700,
+                color:T.text2, padding:"4px 2px",
+              }}>
+                {d.replace("週","")}
+              </div>
+            ))}
+          </div>
+
+          {/* Time grid */}
+          <div style={{
+            display:"grid",
+            gridTemplateColumns:`${TIME_COL_W}px repeat(${activeDays.length},1fr)`,
+          }}>
+            {/* Time labels */}
+            <div style={{ position:"relative", height:GRID_H }}>
+              {hourLabels.map(h => (
+                <div key={h} style={{
+                  position:"absolute",
+                  top: (h*60 - earliestMin) * PX_PER_MIN - 6,
+                  right:4, fontSize:9, color:T.muted,
+                  fontVariantNumeric:"tabular-nums", lineHeight:1,
+                }}>
+                  {String(h).padStart(2,"0")}:00
+                </div>
+              ))}
+            </div>
+
+            {/* Day columns */}
+            {activeDays.map(day => {
+              const dayCourses = semCourses.filter(c => c.day === day);
+              return (
+                <div key={day} style={{
+                  position:"relative", height:GRID_H,
+                  borderLeft:`1px solid ${T.border}`,
+                }}>
+                  {/* Hour lines */}
+                  {hourLabels.map(h => (
+                    <div key={h} style={{
+                      position:"absolute",
+                      top:(h*60 - earliestMin)*PX_PER_MIN,
+                      left:0, right:0,
+                      borderTop:`1px solid ${T.border}`,
+                    }} />
+                  ))}
+
+                  {/* Course blocks */}
+                  {dayCourses.map(c => {
+                    const sMin = toMins(c.startTime);
+                    const eRaw = toMins(c.endTime);
+                    if (sMin === null) return null;
+                    const durMin = (eRaw && eRaw > sMin) ? eRaw - sMin : 50;
+                    const top    = (sMin - earliestMin) * PX_PER_MIN;
+                    const height = Math.max(durMin * PX_PER_MIN, 18);
+                    const col    = colorFor(c.id);
+
+                    return (
+                      <div key={c.id} style={{
+                        position:"absolute",
+                        top: top + 1, left:2, right:2,
+                        height: height - 2,
+                        background: col.bg,
+                        border:`1.5px solid ${col.border}`,
+                        borderRadius:5, padding:"2px 3px",
+                        overflow:"hidden", boxSizing:"border-box", zIndex:1,
+                      }}>
+                        <div style={{
+                          fontSize: Math.min(10, Math.max(8, height/5)),
+                          fontWeight:700, color:col.text,
+                          lineHeight:1.25, overflow:"hidden",
+                          display:"-webkit-box",
+                          WebkitLineClamp: Math.floor(height/12),
+                          WebkitBoxOrient:"vertical",
+                        }}>
+                          {c.name}
+                        </div>
+                        {height > 32 && (
+                          <div style={{fontSize:8,color:col.text,opacity:0.75,marginTop:1}}>
+                            {c.startTime}{c.endTime?`~${c.endTime}`:""}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Bottom hour line */}
+          <div style={{
+            display:"grid",
+            gridTemplateColumns:`${TIME_COL_W}px repeat(${activeDays.length},1fr)`,
+            borderTop:`1px solid ${T.border}`,
+          }}>
+            <div style={{fontSize:9,color:T.muted,textAlign:"right",paddingRight:4,paddingTop:2}}>
+              {String(latestMin/60).padStart(2,"0")}:00
+            </div>
+            {activeDays.map(d=><div key={d} style={{borderLeft:`1px solid ${T.border}`}} />)}
+          </div>
+
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ExamsHomework({ data, setData }) {
+  const [tab, setTab] = useState("考試");
+  const [modal, setModal] = useState(false);
+  const [edit, setEdit] = useState(null);
+  const [form, setForm] = useState({});
+  const [customSubject, setCustomSubject] = useState(false);
+  const [courses] = useStorage("campus-courses", []);
+  const [semester] = useStorage("campus-semester", "大一上");
+  const fileRef = useRef();
+
+  const semCourseNames = courses.filter(c=>c.semester===semester).map(c=>c.name);
+  const CUSTOM_OPT = "__custom__";
+
+  const openExam = (item=null) => {
+    const isCustom = item && item.subject && !semCourseNames.includes(item.subject);
+    setCustomSubject(isCustom || false);
+    if (item) { setEdit(item.id); setForm({name:item.name,subject:item.subject||"",time:item.time||"",note:item.note||""}); }
+    else { setEdit(null); setForm({name:"",subject:semCourseNames[0]||"",time:"",note:""}); setCustomSubject(false); }
+    setModal(true);
+  };
+
+  const openHW = (item=null) => {
+    const isCustom = item && item.subject && !semCourseNames.includes(item.subject);
+    setCustomSubject(isCustom || false);
+    if (item) { setEdit(item.id); setForm({name:item.name,subject:item.subject||"",deadline:item.deadline||"",file:item.file||null,link:item.link||""}); }
+    else { setEdit(null); setForm({name:"",subject:semCourseNames[0]||"",deadline:"",file:null,link:""}); setCustomSubject(false); }
+    setModal(true);
+  };
+
+  const save = () => {
+    const entry = { id:edit||uuid(), kind:tab, ...form };
+    if (edit) setData(data.map(d=>d.id===edit?entry:d));
+    else setData([...data,entry]);
+    setModal(false);
+  };
+
+  const items = data.filter(d=>d.kind===tab).sort((a,b)=>{
+    const da = tab==="考試"?a.time:a.deadline;
+    const db = tab==="考試"?b.time:b.deadline;
+    return da>db?1:-1;
+  });
+
+  const SubjectField = () => (
+    <div>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+        <span style={{fontSize:12,color:T.text3}}>所屬科目</span>
+        <button onClick={()=>{setCustomSubject(v=>!v);setForm(f=>({...f,subject:""}));}}
+          style={{background:"none",border:"none",fontSize:12,color:T.accent2,cursor:"pointer",fontFamily:"inherit"}}>
+          {customSubject?"從課程選擇":"自行輸入"}
+        </button>
+      </div>
+      {customSubject || semCourseNames.length===0
+        ? <Input value={form.subject||""} onChange={v=>setForm(f=>({...f,subject:v}))} placeholder="輸入科目名稱" />
+        : <Select value={form.subject||""} onChange={v=>setForm(f=>({...f,subject:v}))}
+            options={semCourseNames.map(n=>({value:n,label:n}))} />
+      }
+    </div>
+  );
+
+  return (
+    <div>
+      <div style={{display:"flex",gap:0,marginBottom:16,background:T.bg3,borderRadius:12,padding:3}}>
+        {["考試","作業"].map(t=>(
+          <button key={t} onClick={()=>setTab(t)} style={{
+            flex:1,padding:"8px",borderRadius:10,border:"none",cursor:"pointer",
+            background:tab===t?T.card:"transparent",color:tab===t?T.text:T.text3,
+            fontFamily:"inherit",fontWeight:700,fontSize:14,transition:"all 0.15s",
+            boxShadow:tab===t?"0 1px 4px rgba(90,55,30,0.12)":"none",
+          }}>{t==="考試"?"📝 ":"📋 "}{t}</button>
+        ))}
+      </div>
+      <div style={{display:"flex",justifyContent:"flex-end",marginBottom:12}}>
+        <Btn small onClick={()=>tab==="考試"?openExam():openHW()}>+ 新增</Btn>
+      </div>
+      {items.length===0 && <EmptyState icon={tab==="考試"?"📝":"📋"} text={`還沒有${tab}記錄`} />}
+      {items.map(item=>(
+        <Card key={item.id}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+            <div>
+              <div style={{fontSize:14,fontWeight:700,color:T.text}}>{item.name}</div>
+              <div style={{display:"flex",gap:6,flexWrap:"wrap",marginTop:4}}>
+                {item.subject && <Tag label={item.subject} color={T.bg3} />}
+                {tab==="考試" && item.time && <Tag label={new Date(item.time).toLocaleString("zh-TW",{month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"})} color={T.yellow} />}
+                {tab==="作業" && item.deadline && <Tag label={`截止：${new Date(item.deadline).toLocaleString("zh-TW",{month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"})}`} color={T.red+"44"} />}
+              </div>
+              {item.note && <p style={{margin:"4px 0 0",fontSize:12,color:T.text3}}>{item.note}</p>}
+              {item.file && <div style={{fontSize:12,color:T.text3,marginTop:4}}>📎 {item.file.name}</div>}
+              {item.link && (
+                <div style={{marginTop:4}}>
+                  <a href={item.link.startsWith("http")?item.link:"https://"+item.link}
+                    target="_blank" rel="noopener noreferrer"
+                    style={{fontSize:12,color:T.blue,textDecoration:"none",wordBreak:"break-all"}}
+                    onClick={e=>e.stopPropagation()}>
+                    🔗 {item.link}
+                  </a>
+                </div>
+              )}
+            </div>
+            <div style={{display:"flex",gap:4}}>
+              <Btn small variant="ghost" onClick={()=>tab==="考試"?openExam(item):openHW(item)}>編輯</Btn>
+              <Btn small variant="danger" onClick={()=>setData(data.filter(d=>d.id!==item.id))}>刪</Btn>
+            </div>
+          </div>
+        </Card>
+      ))}
+
+      <Modal open={modal} onClose={()=>setModal(false)} title={`${edit?"編輯":"新增"}${tab}`}>
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          <Input value={form.name||""} onChange={v=>setForm(f=>({...f,name:v}))} placeholder={tab==="考試"?"考試名稱":"作業名稱"} />
+          <SubjectField />
+          {tab==="考試" ? <>
+            <div><div style={{fontSize:12,color:T.text3,marginBottom:4}}>考試時間</div>
+              <Input type="datetime-local" value={form.time||""} onChange={v=>setForm(f=>({...f,time:v}))} /></div>
+            <Textarea value={form.note||""} onChange={v=>setForm(f=>({...f,note:v}))} placeholder="備註" rows={2} />
+          </> : <>
+            <div><div style={{fontSize:12,color:T.text3,marginBottom:4}}>截止時間</div>
+              <Input type="datetime-local" value={form.deadline||""} onChange={v=>setForm(f=>({...f,deadline:v}))} /></div>
+            <div>
+              <div style={{fontSize:12,color:T.text3,marginBottom:6,fontWeight:600}}>📎 作業資料（擇一或兩者都填）</div>
+              {/* URL paste */}
+              <div style={{marginBottom:8}}>
+                <div style={{fontSize:12,color:T.text3,marginBottom:4}}>貼上連結</div>
+                <Input
+                  value={form.link||""}
+                  onChange={v=>setForm(f=>({...f,link:v}))}
+                  placeholder="https://... 或貼上任意連結"
+                />
+              </div>
+              {/* File upload */}
+              <div style={{fontSize:12,color:T.text3,marginBottom:4}}>上傳檔案</div>
+              <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                <Btn variant="secondary" style={{flex:1}} onClick={()=>fileRef.current.click()}>
+                  📂 {form.file ? "重新選擇" : "選擇檔案"}
+                </Btn>
+                {form.file && (
+                  <Btn small variant="danger" onClick={()=>setForm(f=>({...f,file:null}))}>移除</Btn>
+                )}
+              </div>
+              {form.file && (
+                <div style={{fontSize:12,color:T.text3,marginTop:4,padding:"6px 10px",
+                  background:T.bg2,borderRadius:8}}>
+                  📎 {form.file.name}
+                </div>
+              )}
+              <input ref={fileRef} type="file" style={{display:"none"}} onChange={e=>{
+                const f=e.target.files[0];
+                if(f) setForm(fm=>({...fm,file:{name:f.name}}));
+              }} />
+            </div>
+          </>}
+          <Btn onClick={save}>儲存</Btn>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+function Activities({ data, setData }) {
+  const [modal, setModal] = useState(false);
+  const [edit, setEdit] = useState(null);
+  const [form, setForm] = useState({ name:"", startDatetime:"", endDatetime:"", note:"" });
+
+  const open = (item=null) => {
+    if (item) { setEdit(item.id); setForm({name:item.name,startDatetime:item.startDatetime||item.datetime||"",endDatetime:item.endDatetime||"",note:item.note||""}); }
+    else { setEdit(null); setForm({name:"",startDatetime:"",endDatetime:"",note:""}); }
+    setModal(true);
+  };
+
+  const save = () => {
+    if (!form.name.trim()) return;
+    if (edit) setData(data.map(d=>d.id===edit?{...d,...form}:d));
+    else setData([...data,{id:uuid(),...form}]);
+    setModal(false);
+  };
+
+  const fmtDT = (dt) => {
+    if (!dt) return "";
+    return new Date(dt).toLocaleString("zh-TW",{month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"});
+  };
+
+  return (
+    <div>
+      <SectionTitle right={<Btn small onClick={()=>open()}>+ 新增</Btn>}>🏆 活動經歷</SectionTitle>
+      {data.length===0 && <EmptyState icon="🎉" text="記錄你的活動與經歷！" />}
+      {[...data].sort((a,b)=>((b.startDatetime||b.datetime||"")>(a.startDatetime||a.datetime||""))?1:-1).map(item=>(
+        <Card key={item.id}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+            <div style={{flex:1}}>
+              <div style={{fontSize:14,fontWeight:700,color:T.text,marginBottom:4}}>{item.name}</div>
+              {(item.startDatetime||item.datetime) && (
+                <div style={{fontSize:12,color:T.muted,marginBottom:4}}>
+                  🕐 {fmtDT(item.startDatetime||item.datetime)}
+                  {item.endDatetime && <span> ~ {fmtDT(item.endDatetime)}</span>}
+                </div>
+              )}
+              {item.startDatetime && item.endDatetime && (() => {
+                const mins = Math.round((new Date(item.endDatetime)-new Date(item.startDatetime))/60000);
+                const h = Math.floor(mins/60), m = mins%60;
+                return <Tag label={`共 ${h>0?h+"小時":""} ${m>0?m+"分":""}`.trim()} color={T.blue} />;
+              })()}
+              {item.note && <p style={{margin:"6px 0 0",fontSize:13,color:T.text2}}>{item.note}</p>}
+            </div>
+            <div style={{display:"flex",gap:4,marginLeft:8}}>
+              <Btn small variant="ghost" onClick={()=>open(item)}>編輯</Btn>
+              <Btn small variant="danger" onClick={()=>setData(data.filter(d=>d.id!==item.id))}>刪</Btn>
+            </div>
+          </div>
+        </Card>
+      ))}
+      <Modal open={modal} onClose={()=>setModal(false)} title={edit?"編輯活動":"新增活動"}>
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          <Input value={form.name} onChange={v=>setForm(f=>({...f,name:v}))} placeholder="活動名稱" />
+          <div>
+            <div style={{fontSize:12,color:T.text3,marginBottom:4}}>開始時間</div>
+            <Input type="datetime-local" value={form.startDatetime} onChange={v=>setForm(f=>({...f,startDatetime:v}))} />
+          </div>
+          <div>
+            <div style={{fontSize:12,color:T.text3,marginBottom:4}}>結束時間</div>
+            <Input type="datetime-local" value={form.endDatetime} onChange={v=>setForm(f=>({...f,endDatetime:v}))} />
+          </div>
+          <Textarea value={form.note} onChange={v=>setForm(f=>({...f,note:v}))} placeholder="備註（選填）" rows={3} />
+          <Btn onClick={save}>儲存</Btn>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════
+// MAIN APP
+// ═══════════════════════════════════════════════════════
+
+const TABS = [
+  { id:"diary", label:"手帳本", icon:"📓" },
+  { id:"plan", label:"計畫本", icon:"📋" },
+  { id:"life", label:"生活本", icon:"🌿" },
+  { id:"campus", label:"校園本", icon:"🎓" },
+];
+
+// ═══════════════════════════════════════════════════════
+// 今日總覽
+// ═══════════════════════════════════════════════════════
+function TodayOverview({ diaryData, tasks, habitData, examHw, courses, semester }) {
+  const todayStr = fmt(new Date());
+  const todayDate = new Date();
+
+  // Today's mood
+  const todayMood = diaryData.find(d => d.date === todayStr);
+
+  // Today's tasks
+  const todayTasks = tasks.filter(t => t.date === todayStr)
+    .sort((a,b) => (a.startTime||"") > (b.startTime||"") ? 1 : -1);
+  const doneTasks = todayTasks.filter(t => t.done).length;
+
+  // This week's habits
+  const key = `${todayDate.getFullYear()}-${String(todayDate.getMonth()+1).padStart(2,"0")}`;
+  const monthHabits = habitData?.habits?.[key] || [];
+  const checks = habitData?.checks || {};
+  const day = todayDate.getDate();
+
+  // Upcoming exams/homework (next 7 days)
+  const upcoming = examHw.filter(e => {
+    const d = e.time || e.deadline;
+    if (!d) return false;
+    const dt = new Date(d);
+    const diff = (dt - todayDate) / (1000*60*60*24);
+    return diff >= 0 && diff <= 7;
+  }).sort((a,b) => (a.time||a.deadline) > (b.time||b.deadline) ? 1 : -1);
+
+  // Today's courses
+  const DOW_MAP = { 0:"週日",1:"週一",2:"週二",3:"週三",4:"週四",5:"週五",6:"週六" };
+  const todayDay = DOW_MAP[todayDate.getDay()];
+  const todayCourses = courses.filter(c =>
+    c.semester === semester && c.day === todayDay
+  ).sort((a,b) => (a.startTime||"") > (b.startTime||"") ? 1 : -1);
+
+  const [taskTypes] = useStorage("task-types", []);
+  const getType = (typeId) => taskTypes.find(t => t.id === typeId);
+
+  return (
+    <div>
+      {/* Header */}
+      <div style={{
+        background: `linear-gradient(135deg, ${T.accent2}22, ${T.yellow}33)`,
+        borderRadius:16, padding:"16px", marginBottom:14,
+        border:`1px solid ${T.border}`,
+      }}>
+        <div style={{fontSize:13,color:T.text3,marginBottom:2}}>
+          {todayDate.toLocaleDateString("zh-TW",{year:"numeric",month:"long",day:"numeric",weekday:"long"})}
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:10}}>
+          <div style={{flex:1}}>
+            <div style={{fontSize:20,fontWeight:800,color:T.text}}>早安 ☀️</div>
+            <div style={{fontSize:13,color:T.text3,marginTop:2}}>
+              今天有 {todayTasks.length} 件任務、{todayCourses.length} 堂課
+            </div>
+          </div>
+          {todayMood ? (
+            <div style={{textAlign:"center"}}>
+              <div style={{fontSize:32}}>{MOODS[todayMood.mood]}</div>
+              <div style={{fontSize:11,color:T.text3}}>{MOOD_LABELS[todayMood.mood]}</div>
+            </div>
+          ) : (
+            <div style={{
+              textAlign:"center",padding:"8px 12px",borderRadius:12,
+              background:T.bg2,border:`1px dashed ${T.border2}`,
+            }}>
+              <div style={{fontSize:22}}>🌸</div>
+              <div style={{fontSize:10,color:T.muted}}>記錄今日心情</div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Today's tasks */}
+      <Card style={{marginBottom:12}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+          <span style={{fontSize:13,fontWeight:700,color:T.text2}}>✅ 今日任務</span>
+          {todayTasks.length > 0 && (
+            <span style={{fontSize:12,color:T.muted}}>{doneTasks}/{todayTasks.length} 完成</span>
+          )}
+        </div>
+        {todayTasks.length === 0
+          ? <div style={{fontSize:12,color:T.muted,textAlign:"center",padding:"8px 0"}}>今天沒有任務</div>
+          : <>
+            {todayTasks.length > 1 && (
+              <div style={{height:5,background:T.bg3,borderRadius:3,marginBottom:8,overflow:"hidden"}}>
+                <div style={{height:"100%",width:`${doneTasks/todayTasks.length*100}%`,
+                  background:T.accent2,borderRadius:3,transition:"width 0.4s"}} />
+              </div>
+            )}
+            {todayTasks.map(t => {
+              const type = getType(t.typeId);
+              return (
+                <div key={t.id} style={{
+                  display:"flex",alignItems:"center",gap:8,
+                  padding:"6px 0",borderBottom:`1px solid ${T.border}`,
+                }}>
+                  <div style={{
+                    width:16,height:16,borderRadius:4,flexShrink:0,
+                    background:t.done?(type?type.color:T.accent2):"transparent",
+                    border:`2px solid ${type?type.color:t.done?T.accent2:T.border2}`,
+                    display:"flex",alignItems:"center",justifyContent:"center",
+                  }}>
+                    {t.done && <span style={{color:"#fff",fontSize:10}}>✓</span>}
+                  </div>
+                  <div style={{flex:1,minWidth:0}}>
+                    <span style={{
+                      fontSize:13,color:t.done?T.text3:T.text,
+                      textDecoration:t.done?"line-through":"none",
+                    }}>{t.name}</span>
+                    {type && <span style={{
+                      fontSize:10,marginLeft:6,padding:"1px 6px",borderRadius:8,
+                      background:type.color+"33",color:type.color,fontWeight:600,
+                    }}>{type.name}</span>}
+                  </div>
+                  {(t.startTime||t.time) && (
+                    <span style={{fontSize:11,color:T.muted,flexShrink:0}}>
+                      {t.startTime||t.time}
+                    </span>
+                  )}
+                </div>
+              );
+            })}
+          </>
+        }
+      </Card>
+
+      {/* Today's courses */}
+      {todayCourses.length > 0 && (
+        <Card style={{marginBottom:12}}>
+          <div style={{fontSize:13,fontWeight:700,color:T.text2,marginBottom:10}}>🗓 今日課表</div>
+          {todayCourses.map((c,i) => (
+            <div key={c.id} style={{
+              display:"flex",alignItems:"center",gap:8,
+              padding:"6px 0",borderBottom:i<todayCourses.length-1?`1px solid ${T.border}`:"none",
+            }}>
+              <div style={{
+                width:3,height:32,borderRadius:2,flexShrink:0,
+                background:T.accent2,
+              }} />
+              <div style={{flex:1}}>
+                <div style={{fontSize:13,fontWeight:600,color:T.text}}>{c.name}</div>
+                {c.teacher && <div style={{fontSize:11,color:T.muted}}>{c.teacher}</div>}
+              </div>
+              {c.startTime && (
+                <span style={{fontSize:11,color:T.accent3,fontWeight:600}}>
+                  {c.startTime}{c.endTime?`~${c.endTime}`:""}
+                </span>
+              )}
+            </div>
+          ))}
+        </Card>
+      )}
+
+      {/* Habits today */}
+      {monthHabits.length > 0 && (
+        <Card style={{marginBottom:12}}>
+          <div style={{fontSize:13,fontWeight:700,color:T.text2,marginBottom:10}}>🔥 今日打卡</div>
+          <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+            {monthHabits.map(h => {
+              const done = checks[`${key}-${h}-${day}`];
+              return (
+                <div key={h} style={{
+                  padding:"5px 12px",borderRadius:20,fontSize:12,fontWeight:600,
+                  background:done?T.accent2+"33":T.bg2,
+                  border:`1.5px solid ${done?T.accent2:T.border}`,
+                  color:done?T.accent3:T.text3,
+                }}>
+                  {done?"✓ ":""}{h}
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+      )}
+
+      {/* Upcoming exams/homework */}
+      {upcoming.length > 0 && (
+        <Card style={{marginBottom:12}}>
+          <div style={{fontSize:13,fontWeight:700,color:T.text2,marginBottom:10}}>📌 即將到期（7天內）</div>
+          {upcoming.map(e => {
+            const d = e.time || e.deadline;
+            const dt = new Date(d);
+            const diff = Math.ceil((dt - todayDate) / (1000*60*60*24));
+            const urgent = diff <= 2;
+            return (
+              <div key={e.id} style={{
+                display:"flex",alignItems:"center",gap:8,
+                padding:"6px 0",borderBottom:`1px solid ${T.border}`,
+              }}>
+                <span style={{fontSize:14}}>{e.kind==="考試"?"📝":"📋"}</span>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:13,fontWeight:600,color:T.text}}>{e.name}</div>
+                  {e.subject && <div style={{fontSize:11,color:T.muted}}>{e.subject}</div>}
+                </div>
+                <span style={{
+                  fontSize:11,fontWeight:700,padding:"2px 8px",borderRadius:10,flexShrink:0,
+                  background:urgent?T.red+"33":T.yellow+"55",
+                  color:urgent?T.red:T.text3,
+                }}>
+                  {diff===0?"今天":diff===1?"明天":`${diff}天後`}
+                </span>
+              </div>
+            );
+          })}
+        </Card>
+      )}
+    </div>
+  );
+}
+
+const DIARY_SUBS = [
+  { id:"week", label:"週手帳", icon:"📅" },
+  { id:"month", label:"月概覽", icon:"📊" },
+  { id:"habit", label:"打卡牆", icon:"✅" },
+  { id:"quick", label:"隨手記", icon:"📷" },
+];
+const PLAN_SUBS = [
+  { id:"today", label:"今日任務", icon:"✅" },
+  { id:"calendar", label:"月視圖", icon:"📅" },
+  { id:"goals", label:"目標牆", icon:"🎯" },
+  { id:"projects", label:"專案錄", icon:"📁" },
+];
+const LIFE_SUBS = [
+  { id:"finance", label:"財務帳", icon:"💰" },
+  { id:"period", label:"生理期", icon:"🌸" },
+  { id:"bookmarks", label:"收藏夾", icon:"🔖" },
+  { id:"memos", label:"備忘錄", icon:"📋" },
+];
+const CAMPUS_SUBS = [
+  { id:"courses", label:"課程管理", icon:"📚" },
+  { id:"schedule", label:"課表", icon:"🗓" },
+  { id:"exams", label:"考試作業", icon:"📝" },
+  { id:"activities", label:"活動經歷", icon:"🏆" },
+];
+
+function App() {
+  const [tab, setTab] = useState("diary");
+  const [sub, setSub] = useState("week");
+  const [showOverview, setShowOverview] = useState(false);
+  const [syncModal, setSyncModal] = useState(false);
+  const [importResult, setImportResult] = useState(null);
+  const [copyDone, setCopyDone] = useState(false);
+  const [exportJson, setExportJson] = useState("");
+  const [pasteText, setPasteText] = useState("");
+  const [showPasteBox, setShowPasteBox] = useState(false);
+  const [cloudStatus, setCloudStatus] = useState("loading"); // "loading"|"synced"|"offline"
+  const importFileRef = useRef();
+
+  // Load from Supabase on first open (only once per session)
+  useEffect(() => {
+    if (sessionStorage.getItem("__synced")) {
+      setCloudStatus("synced");
+      return;
+    }
+    sbLoad().then(cloudData => {
+      sessionStorage.setItem("__synced", "1");
+      if (cloudData && Object.keys(cloudData).length > 0) {
+        // Write cloud data to localStorage
+        let changed = false;
+        ALL_KEYS.forEach(k => {
+          if (cloudData[k] !== undefined) {
+            const existing = localStorage.getItem(k);
+            const incoming = JSON.stringify(cloudData[k]);
+            if (existing !== incoming) {
+              localStorage.setItem(k, incoming);
+              changed = true;
+            }
+          }
+        });
+        setCloudStatus("synced");
+        // Only reload if data actually changed
+        if (changed) window.location.reload();
+      } else {
+        setCloudStatus("synced");
+        scheduleCloudSave();
+      }
+    }).catch(() => {
+      sessionStorage.setItem("__synced", "1");
+      setCloudStatus("offline");
+    });
+  }, []);
+
+  // Diary
+  const [diaryData, setDiaryData] = useStorage("diary-entries", []);
+  const [habitData, setHabitData] = useStorage("habit-data", { habits:{}, checks:{} });
+  const [quickData, setQuickData] = useStorage("quick-notes", []);
+
+  // Plan
+  const [tasks, setTasks] = useStorage("tasks", []);
+  const [goals, setGoals] = useStorage("goals", []);
+  const [projects, setProjects] = useStorage("projects", []);
+
+  // Life
+  const [finance, setFinance] = useStorage("finance", []);
+  const [period, setPeriod] = useStorage("period", []);
+  const [bookmarks, setBookmarks] = useStorage("bookmarks", []);
+  const [memos, setMemos] = useStorage("memos", []);
+
+  // Campus
+  const [semester, setSemester] = useStorage("campus-semester", "大一上");
+  const [semModal, setSemModal] = useState(false);
+  const [courses, setCourses] = useStorage("campus-courses", []);
+  const [gradReq, setGradReq] = useStorage("grad-req", { total:"", types:{} });
+  const [examHw, setExamHw] = useStorage("exam-hw", []);
+  const [activities, setActivities] = useStorage("activities", []);
+
+  const subMap = { diary:DIARY_SUBS, plan:PLAN_SUBS, life:LIFE_SUBS, campus:CAMPUS_SUBS };
+  const subs = subMap[tab];
+
+  const switchTab = (id) => {
+    setTab(id);
+    setShowOverview(false);
+    const map = { diary:"week", plan:"today", life:"finance", campus:"courses" };
+    setSub(map[id]);
+  };
+
+  const renderContent = () => {
+    if (tab==="diary") {
+      if (sub==="week") return <WeekDiary data={diaryData} setData={setDiaryData} />;
+      if (sub==="month") return <MonthOverview data={diaryData} />;
+      if (sub==="habit") return <HabitWall data={habitData} setData={setHabitData} />;
+      if (sub==="quick") return <QuickNotes data={quickData} setData={setQuickData} />;
+    }
+    if (tab==="plan") {
+      if (sub==="today") return <TodayTasks data={tasks} setData={setTasks} />;
+      if (sub==="calendar") return <MonthCalendar tasks={tasks} />;
+      if (sub==="goals") return <GoalWall data={goals} setData={setGoals} />;
+      if (sub==="projects") return <ProjectLog data={projects} setData={setProjects} />;
+    }
+    if (tab==="life") {
+      if (sub==="finance") return <Finance data={finance} setData={setFinance} />;
+      if (sub==="period") return <PeriodTracker data={period} setData={setPeriod} />;
+      if (sub==="bookmarks") return <Bookmarks data={bookmarks} setData={setBookmarks} />;
+      if (sub==="memos") return <Memos data={memos} setData={setMemos} />;
+    }
+    if (tab==="campus") {
+      if (sub==="courses") return <CourseManagement courses={courses} setCourses={setCourses} gradReq={gradReq} setGradReq={setGradReq} semester={semester} />;
+      if (sub==="schedule") return <CourseSchedule courses={courses} semester={semester} />;
+      if (sub==="exams") return <ExamsHomework data={examHw} setData={setExamHw} />;
+      if (sub==="activities") return <Activities data={activities} setData={setActivities} />;
+    }
+  };
+
+  return (
+    <div style={{
+      minHeight:"100vh", background:T.bg,
+      fontFamily:"'Noto Sans TC', 'Microsoft JhengHei', sans-serif",
+      maxWidth:480, margin:"0 auto", position:"relative",
+    }}>
+      {/* Header */}
+      <div style={{
+        background:T.card, borderBottom:`1px solid ${T.border}`,
+        padding:"14px 16px 10px", position:"sticky", top:0, zIndex:100,
+        boxShadow:"0 2px 12px rgba(90,55,30,0.06)",
+      }}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}>
+          <div style={{display:"flex",alignItems:"center",gap:8}}>
+            <span style={{fontSize:22}}>🫖</span>
+            <div>
+              <div style={{fontSize:17,fontWeight:800,color:T.text,letterSpacing:1}}>My Planner</div>
+              <div style={{fontSize:11,color:T.muted}}>{new Date().toLocaleDateString("zh-TW",{month:"long",day:"numeric",weekday:"short"})}</div>
+            </div>
+          </div>
+          <div style={{display:"flex",gap:6,alignItems:"center"}}>
+            <button onClick={()=>setShowOverview(v=>!v)} style={{
+              background: showOverview ? T.accent2 : T.bg2,
+              border:`1px solid ${showOverview ? T.accent2 : T.border}`,
+              borderRadius:10, padding:"6px 10px", cursor:"pointer", fontSize:12,
+              color: showOverview ? "#fff" : T.text2,
+              fontFamily:"inherit", fontWeight:600,
+              display:"flex", alignItems:"center", gap:4,
+            }}>🏠 今日</button>
+            <button onClick={()=>{setImportResult(null);setCopyDone(false);setExportJson("");setPasteText("");setShowPasteBox(false);setSyncModal(true);}} style={{
+              background:T.bg2,border:`1px solid ${T.border}`,borderRadius:10,
+              padding:"6px 10px",cursor:"pointer",fontSize:12,color:T.text2,
+              fontFamily:"inherit",fontWeight:600,display:"flex",alignItems:"center",gap:4,
+            }}>
+              <span style={{
+                width:7,height:7,borderRadius:"50%",display:"inline-block",flexShrink:0,
+                background: cloudStatus==="synced"?"#4CAF50": cloudStatus==="loading"?T.accent2: T.muted,
+              }} />
+              ☁️ 備份
+            </button>
+            {tab==="campus" && (
+              <Btn small variant="secondary" onClick={()=>setSemModal(true)}>🎓 {semester}</Btn>
+            )}
+          </div>
+        </div>
+
+        {/* Main tabs */}
+        <div style={{display:"flex",gap:0,background:T.bg3,borderRadius:12,padding:3}}>
+          {TABS.map(t=>(
+            <button key={t.id} onClick={()=>switchTab(t.id)} style={{
+              flex:1,padding:"7px 4px",borderRadius:10,border:"none",cursor:"pointer",
+              background:tab===t.id?T.card:"transparent",
+              color:tab===t.id?T.accent3:T.text3,
+              fontFamily:"inherit",fontWeight:tab===t.id?700:500,fontSize:12,
+              transition:"all 0.15s",boxShadow:tab===t.id?"0 1px 4px rgba(90,55,30,0.12)":"none",
+              display:"flex",flexDirection:"column",alignItems:"center",gap:1,
+            }}>
+              <span style={{fontSize:16}}>{t.icon}</span>
+              <span>{t.label}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Sub tabs — hidden when overview is open */}
+      {!showOverview && (
+      <div style={{
+        background:T.bg, borderBottom:`1px solid ${T.border}`,
+        padding:"8px 12px", display:"flex", gap:6, overflowX:"auto",
+        position:"sticky", top:90, zIndex:99,
+      }}>
+        {subs.map(s=>(
+          <button key={s.id} onClick={()=>setSub(s.id)} style={{
+            padding:"6px 14px",borderRadius:20,border:`1.5px solid ${sub===s.id?T.accent2:T.border}`,
+            background:sub===s.id?T.accent2+"22":T.card,
+            color:sub===s.id?T.accent3:T.text3,
+            fontFamily:"inherit",fontWeight:sub===s.id?700:500,fontSize:12,
+            cursor:"pointer",whiteSpace:"nowrap",
+            transition:"all 0.15s",
+          }}>
+            {s.icon} {s.label}
+          </button>
+        ))}
+      </div>
+      )}
+
+      {/* Content */}
+      <div style={{padding:"16px",paddingBottom:32}}>
+        {showOverview
+          ? <TodayOverview diaryData={diaryData} tasks={tasks} habitData={habitData} examHw={examHw} courses={courses} semester={semester} />
+          : renderContent()
+        }
+      </div>
+
+      {/* Semester Modal */}
+      <Modal open={semModal} onClose={()=>setSemModal(false)} title="選擇學期">
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+          {SEMESTERS.map(s=>(
+            <button key={s} onClick={()=>{setSemester(s);setSemModal(false);}} style={{
+              padding:"12px",borderRadius:12,border:`2px solid ${semester===s?T.accent2:T.border}`,
+              background:semester===s?T.accent2+"22":T.card,
+              color:semester===s?T.accent3:T.text,
+              fontFamily:"inherit",fontWeight:semester===s?700:500,fontSize:14,cursor:"pointer",
+            }}>{s}</button>
+          ))}
+        </div>
+      </Modal>
+
+      {/* Sync / Backup Modal */}
+      <Modal open={syncModal} onClose={()=>{setSyncModal(false);setImportResult(null);setCopyDone(false);}} title="☁️ 資料備份與還原">
+        <div style={{display:"flex",flexDirection:"column",gap:14}}>
+
+          {/* Export — copy JSON to clipboard */}
+          <div style={{background:T.bg2,borderRadius:12,padding:"14px"}}>
+            <div style={{fontSize:14,fontWeight:700,color:T.text,marginBottom:4}}>📤 匯出備份</div>
+            <p style={{margin:"0 0 10px",fontSize:13,color:T.text3,lineHeight:1.5}}>
+              點「複製備份內容」，再貼到記事本（或任何文字軟體）另存成 <strong>.txt</strong> 或 <strong>.json</strong> 檔案儲存。
+            </p>
+            {copyDone ? (
+              <div style={{background:"#A8C5A0"+"55",border:`1px solid #A8C5A0`,borderRadius:10,
+                padding:"12px",textAlign:"center"}}>
+                <div style={{fontSize:22,marginBottom:4}}>✅</div>
+                <div style={{fontSize:14,fontWeight:700,color:"#3A6A3A"}}>已複製到剪貼簿！</div>
+                <div style={{fontSize:12,color:"#3A6A3A",marginTop:4}}>
+                  請打開記事本，貼上（Ctrl+V 或長按貼上），再儲存為 .txt 檔保管。
+                </div>
+              </div>
+            ) : (
+              <Btn onClick={()=>{
+                const snapshot = {};
+                ALL_KEYS.forEach(k => {
+                  try {
+                    const v = localStorage.getItem(k);
+                    if (v !== null) snapshot[k] = JSON.parse(v);
+                  } catch {}
+                });
+                snapshot.__exportedAt = new Date().toISOString();
+                const json = JSON.stringify(snapshot, null, 2);
+                navigator.clipboard.writeText(json)
+                  .then(()=>setCopyDone(true))
+                  .catch(()=>{
+                    // Fallback: show text in a textarea for manual copy
+                    setExportJson(json);
+                  });
+              }} style={{width:"100%"}}>📋 複製備份內容</Btn>
+            )}
+            {exportJson && !copyDone && (
+              <div style={{marginTop:10}}>
+                <div style={{fontSize:12,color:T.text3,marginBottom:4}}>
+                  自動複製失敗，請手動全選以下內容後複製：
+                </div>
+                <textarea
+                  readOnly
+                  value={exportJson}
+                  onFocus={e=>e.target.select()}
+                  rows={5}
+                  style={{width:"100%",fontSize:11,borderRadius:8,border:`1px solid ${T.border}`,
+                    padding:"8px",background:T.card,color:T.text,fontFamily:"monospace",
+                    resize:"none",boxSizing:"border-box"}}
+                />
+              </div>
+            )}
+          </div>
+
+          {/* Import */}
+          <div style={{background:T.bg2,borderRadius:12,padding:"14px"}}>
+            <div style={{fontSize:14,fontWeight:700,color:T.text,marginBottom:4}}>📥 匯入還原</div>
+            <p style={{margin:"0 0 10px",fontSize:13,color:T.text3,lineHeight:1.5}}>
+              ⚠️ 匯入後目前資料會被覆蓋，請先確認已備份。
+            </p>
+
+            {importResult==="ok" && (
+              <div style={{background:"#A8C5A0"+"44",border:`1px solid #A8C5A0`,borderRadius:8,
+                padding:"8px 12px",marginBottom:10,fontSize:13,color:"#3A6A3A",fontWeight:600}}>
+                ✅ 還原成功！請重新整理頁面以套用資料。
+              </div>
+            )}
+            {importResult==="fail" && (
+              <div style={{background:T.red+"33",border:`1px solid ${T.red}`,borderRadius:8,
+                padding:"8px 12px",marginBottom:10,fontSize:13,color:T.red,fontWeight:600}}>
+                ❌ 格式錯誤，請確認貼上的是完整備份內容。
+              </div>
+            )}
+
+            {/* Option 1: paste text */}
+            <div style={{marginBottom:10}}>
+              <div style={{fontSize:13,fontWeight:600,color:T.text2,marginBottom:6}}>
+                方式一：貼上備份文字
+              </div>
+              <div style={{fontSize:12,color:T.text3,marginBottom:8,lineHeight:1.5}}>
+                從 Google 文件、備忘錄複製備份內容後貼到下方，再點「還原」。
+              </div>
+              {!showPasteBox ? (
+                <Btn variant="secondary" style={{width:"100%"}} onClick={()=>setShowPasteBox(true)}>
+                  📋 貼上備份文字
+                </Btn>
+              ) : (
+                <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                  <textarea
+                    value={pasteText}
+                    onChange={e=>setPasteText(e.target.value)}
+                    placeholder="長按此處貼上備份內容..."
+                    rows={5}
+                    style={{width:"100%",padding:"10px 12px",borderRadius:10,
+                      border:`1.5px solid ${T.border}`,background:T.card,color:T.text,
+                      fontSize:12,fontFamily:"monospace",resize:"none",
+                      outline:"none",boxSizing:"border-box"}}
+                  />
+                  <div style={{display:"flex",gap:8}}>
+                    <Btn style={{flex:1}} onClick={()=>{
+                      try {
+                        const parsed = JSON.parse(pasteText.trim());
+                        Object.entries(parsed).forEach(([k,v])=>{
+                          if (!k.startsWith("__")) localStorage.setItem(k, JSON.stringify(v));
+                        });
+                        setImportResult("ok");
+                        setPasteText("");
+                        setShowPasteBox(false);
+                      } catch {
+                        setImportResult("fail");
+                      }
+                    }}>還原</Btn>
+                    <Btn variant="ghost" onClick={()=>{setShowPasteBox(false);setPasteText("");}}>取消</Btn>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Divider */}
+            <div style={{display:"flex",alignItems:"center",gap:8,margin:"4px 0 10px"}}>
+              <div style={{flex:1,height:1,background:T.border}} />
+              <span style={{fontSize:12,color:T.muted}}>或</span>
+              <div style={{flex:1,height:1,background:T.border}} />
+            </div>
+
+            {/* Option 2: file */}
+            <div>
+              <div style={{fontSize:13,fontWeight:600,color:T.text2,marginBottom:6}}>
+                方式二：選擇備份檔案
+              </div>
+              <div style={{fontSize:12,color:T.text3,marginBottom:8}}>
+                選擇之前匯出的 .json 或 .txt 備份檔案。
+              </div>
+              <Btn variant="secondary" style={{width:"100%"}} onClick={()=>importFileRef.current.click()}>
+                📂 選擇備份檔案
+              </Btn>
+              <input
+                ref={importFileRef} type="file" accept=".json,.txt" style={{display:"none"}}
+                onChange={e=>{
+                  const f = e.target.files[0];
+                  if (!f) return;
+                  importAllData(f, (ok)=>{ setImportResult(ok?"ok":"fail"); });
+                  e.target.value="";
+                }}
+              />
+            </div>
+          </div>
+
+          {/* Tips */}
+          <div style={{fontSize:12,color:T.text2,lineHeight:1.8,
+            background:T.yellow+"33",borderRadius:8,padding:"10px 12px",border:`1px solid ${T.yellow}`}}>
+            💡 <strong>建議備份流程：</strong><br/>
+            點「複製備份內容」→ 打開 Google 文件貼上儲存<br/>
+            還原時：從 Google 文件複製 → 貼到「貼上備份文字」→ 點還原
+          </div>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+    ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+    document.getElementById('loading').style.display='none';
+  </script>
+  <script>
+    if('serviceWorker' in navigator){
+      window.addEventListener('load',()=>{
+        navigator.serviceWorker.register('/project/service-worker.js').catch(()=>{});
+      });
+    }
+  </script>
+</body>
+</html>
